@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b1220">
+    <title>NetEye | OT Security Monitor</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="NetEye 홈">
+        <span class="brand-mark">N</span>
+        <span>NETEYE <small>OT VISIBILITY</small></span>
+      </a>
+      <div class="topbar-right">
+        <span id="sensor-status" class="status-pill status-offline">
+          <span class="status-dot"></span>
+          센서 연결 대기
+        </span>
+        <span class="topbar-label">수동 모니터링</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="page-heading">
+        <div>
+          <p class="eyebrow">NETWORK OVERVIEW</p>
+          <h1>자산 토폴로지</h1>
+          <p class="subtitle">관측된 OT 자산과 네트워크 통신 관계를 실시간으로 확인합니다.</p>
+        </div>
+        <div class="heading-actions">
+          <span id="import-status" class="import-status"></span>
+          <label class="button" title="pcap / pcapng 파일을 분석합니다">
+            <input id="pcap-input" type="file" accept=".pcap,.pcapng,.cap" hidden>
+            PCAP 분석
+          </label>
+          <div class="updated-label"><span class="pulse"></span> 실시간 업데이트</div>
+        </div>
+      </section>
+
+      <section id="baseline-bar" class="baseline-bar mode-learning" aria-label="베이스라인 모드">
+        <div class="baseline-state">
+          <span class="mode-badge" id="mode-badge">학습 중</span>
+          <div>
+            <strong id="mode-title">정상 통신 학습 중</strong>
+            <p id="mode-desc">관측되는 자산·통신·명령을 정상 베이스라인으로 기록합니다. 위험 명령 경고는 학습 중에도 발생합니다.</p>
+          </div>
+        </div>
+        <div class="baseline-counts">
+          <span><b id="bl-assets">0</b> 자산</span>
+          <span><b id="bl-links">0</b> 통신</span>
+          <span><b id="bl-ops">0</b> 명령</span>
+        </div>
+        <div class="baseline-actions">
+          <button id="btn-detect" class="button">탐지 모드 시작</button>
+          <select id="learn-hours" aria-label="학습 기간">
+            <option value="">기간: 수동 종료</option>
+            <option value="1">1시간</option>
+            <option value="24">24시간</option>
+            <option value="168">7일</option>
+          </select>
+          <button id="btn-learn" class="button ghost">학습 재개</button>
+          <button id="btn-reset" class="button danger" title="베이스라인을 비우고 처음부터 학습">초기화 후 재학습</button>
+        </div>
+      </section>
+
+      <section class="stat-grid" aria-label="네트워크 요약">
+        <article class="stat-card">
+          <span class="stat-label">관측 자산</span>
+          <strong id="stat-assets">0</strong>
+          <span class="stat-foot">네트워크에서 발견됨</span>
+        </article>
+        <article class="stat-card accent-card">
+          <span class="stat-label">식별된 OT 자산</span>
+          <strong id="stat-ot-assets">0</strong>
+          <span class="stat-foot">프로토콜 근거 기반 추정</span>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">통신 관계</span>
+          <strong id="stat-links">0</strong>
+          <span class="stat-foot">클라이언트 → 서버</span>
+        </article>
+        <article class="stat-card alert-card">
+          <span class="stat-label">미확인 경고</span>
+          <strong id="stat-alerts">0</strong>
+          <span class="stat-foot"><span id="stat-alerts-high">0</span>건 높음/심각</span>
+        </article>
+      </section>
+
+      <section class="workspace">
+        <div class="graph-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>네트워크 맵</h2>
+              <p>노드를 선택하면 자산 식별 정보와 관측 근거를 확인할 수 있습니다.</p>
+            </div>
+            <label class="search-box">
+              <span aria-hidden="true">⌕</span>
+              <input id="asset-search" type="search" placeholder="IP, 벤더, 모델, 유형 검색" autocomplete="off">
+            </label>
+          </div>
+          <div class="graph-wrap">
+            <svg id="topology" viewBox="0 0 960 520" role="img" aria-label="자산 통신 관계 그래프">
+              <defs>
+                <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M0,0 L8,4 L0,8 z" fill="#62748c"></path>
+                </marker>
+              </defs>
+              <g id="edges"></g>
+              <g id="nodes"></g>
+            </svg>
+            <div id="empty-state" class="empty-state">
+              <div class="empty-icon">⌁</div>
+              <strong>아직 관측된 자산이 없습니다</strong>
+              <span>미러링 인터페이스를 설정하면 패킷에서 자산과 연결을 자동으로 표시합니다.</span>
+            </div>
+          </div>
+          <div class="legend">
+            <span><i class="legend-dot plc"></i> PLC</span>
+            <span><i class="legend-dot power"></i> RTU/IED</span>
+            <span><i class="legend-dot workstation"></i> EWS/HMI</span>
+            <span><i class="legend-dot industrial"></i> 기타 OT 장비</span>
+            <span><i class="legend-dot unknown"></i> 미확인</span>
+            <span><i class="legend-line"></i> 관측된 통신</span>
+          </div>
+        </div>
+
+        <aside class="details-panel">
+          <div class="panel-heading detail-heading">
+            <div>
+              <h2>자산 정보</h2>
+              <p>네트워크에서 확인된 장비</p>
+            </div>
+            <span id="asset-count-badge" class="count-badge">0</span>
+          </div>
+          <div id="asset-list" class="asset-list">
+            <div class="list-placeholder">자산이 관측되면 여기에 표시됩니다.</div>
+          </div>
+          <div id="asset-detail" class="asset-detail">
+            <div class="detail-placeholder">
+              <span class="detail-placeholder-icon">◎</span>
+              <span>그래프 또는 목록에서 자산을 선택하세요.</span>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="alerts-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>보안 경고</h2>
+            <p>위험 명령(정책)과 베이스라인 이탈(신규 자산·통신·명령)을 탐지합니다. 정상인 이탈은 “정상 등록”으로 베이스라인에 추가하세요.</p>
+          </div>
+          <div class="alert-filters">
+            <select id="alert-source" aria-label="경고 유형">
+              <option value="">전체 유형</option>
+              <option value="policy">위험 명령</option>
+              <option value="baseline">베이스라인 이탈</option>
+            </select>
+            <label class="toggle"><input id="show-acked" type="checkbox"> 확인된 경고 표시</label>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="alerts-table">
+            <thead>
+              <tr><th>심각도</th><th>유형</th><th>경고</th><th>출발지 → 목적지</th><th>프로토콜</th><th>횟수</th><th>최근 발생</th><th></th></tr>
+            </thead>
+            <tbody id="alerts-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <span>NetEye · 패킷 내용은 저장하지 않습니다.</span>
+        <span id="capture-interface">센서 인터페이스 미설정</span>
+      </footer>
+    </main>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>
