@@ -221,10 +221,11 @@ pub fn client_bucket(ip: &str) -> String {
 
 /// Make room for one entry: drop the least recently used counter without an active lock (made-up
 /// names first). Returns false when every entry is actively locked.
-fn make_room<K: Clone + std::hash::Hash + Eq>(map: &mut HashMap<K, Count>, now: Instant) -> bool {
-    // Counters of real accounts are never dropped; only made-up names and idle clients make room.
+fn make_room<K: Clone + std::hash::Hash + Eq>(map: &mut HashMap<K, Count>, now: Instant, keep_real: bool) -> bool {
+    // Made-up names go first; real ones only when allowed (the account table, bounded by the number
+    // of real users, keeps them; the per-client tables may drop idle ones).
     let victim = map.iter()
-        .filter(|(_, c)| c.active(now).is_none() && !c.real)
+        .filter(|(_, c)| c.active(now).is_none() && !(keep_real && c.real))
         .min_by_key(|(_, c)| (c.real, c.touched))
         .map(|(k, _)| k.clone());
     match victim {
@@ -260,7 +261,7 @@ impl Throttle {
 
         // Per client, across every name tried (the same for real and made-up names).
         if !st.clients.contains_key(&client) && st.clients.len() >= THROTTLE_CLIENTS
-            && !make_room(&mut st.clients, now) {
+            && !make_room(&mut st.clients, now, false) {
             st.saturated_until = Some(now + LOCKOUT);
             return;
         }
@@ -272,11 +273,20 @@ impl Throttle {
         source.touched = now;
         if source.failures >= CLIENT_FAILURES {
             source.until = Some(now + LOCKOUT);
-            return; // this client is held off: it no longer adds entries for further names
+        }
+        // A held-off client is already refused for every name, so new entries for it would only
+        // fill the tables: it keeps counting against names it already tried and creates nothing
+        // new. A client trusted for this name is exempt from that refusal, so it is always counted
+        // (at most TRUSTED_PER_ACCOUNT such clients per real account).
+        let trusted = st.trusted.get(username).is_some_and(|c| c.contains(&client));
+        let held_off = !trusted && st.clients.get(&client).and_then(|c| c.until).is_some_and(|u| u > now);
+        let key = (username.to_string(), client);
+        if held_off && !st.accounts.contains_key(username) && !st.pairs.contains_key(&key) {
+            return;
         }
 
         if !st.accounts.contains_key(username) && st.accounts.len() >= THROTTLE_ACCOUNTS
-            && !make_room(&mut st.accounts, now) {
+            && !make_room(&mut st.accounts, now, true) {
             st.saturated_until = Some(now + LOCKOUT);
             return;
         }
@@ -290,8 +300,10 @@ impl Throttle {
             account.until = Some(now + LOCKOUT);
         }
 
-        let key = (username.to_string(), client);
-        if !st.pairs.contains_key(&key) && st.pairs.len() >= THROTTLE_PAIRS && !make_room(&mut st.pairs, now) {
+        if held_off && !st.pairs.contains_key(&key) {
+            return;
+        }
+        if !st.pairs.contains_key(&key) && st.pairs.len() >= THROTTLE_PAIRS && !make_room(&mut st.pairs, now, false) {
             st.saturated_until = Some(now + LOCKOUT);
             return;
         }
@@ -448,6 +460,17 @@ mod tests {
         }
         assert!(throttle.locked("admin", "10.0.0.8").is_some(), "the real account is still counted");
         assert!(throttle.locked("admin", "10.0.0.1").is_none());
+
+        // A trusted machine past its client budget still hits the per-account+client lock.
+        let t = Throttle::default();
+        t.success("admin", "10.0.0.5");
+        for i in 0..CLIENT_FAILURES {
+            t.failure(&format!("x{i}"), "10.0.0.5", false);
+        }
+        for _ in 0..MAX_FAILURES {
+            t.failure("admin", "10.0.0.5", true);
+        }
+        assert!(t.locked("admin", "10.0.0.5").is_some(), "no unlimited guessing from a trusted client");
     }
 
     #[test]
