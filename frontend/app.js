@@ -46,10 +46,16 @@ function critBadge(asset) {
   return c ? `<span class="crit-badge crit-${c}" title="중요도">${CRIT_LABEL[c]}</span>` : "";
 }
 
+/** Who an internet address belongs to: organisation (AS) and the name used to reach it. */
+function orgText(asset) {
+  const parts = [asset.org && asset.org.name, asset.domains && asset.domains[asset.domains.length - 1]].filter(Boolean);
+  return parts.join(" · ");
+}
+
 function subtitle(asset) {
   const identity = [asset.vendor, asset.model].filter(Boolean).join(" ");
   const host = [asset.hostname, asset.os].filter(Boolean).join(" · ");
-  return identity || host || shortType(asset);
+  return identity || host || orgText(asset) || shortType(asset);
 }
 
 function formatTime(value) {
@@ -112,7 +118,9 @@ graphIsolated.addEventListener("change", () => graph.setOption("hideIsolated", g
 
 function searchText(asset) {
   const m = asset.manual || {};
+  const org = asset.org || {};
   return [asset.label, asset.ip, asset.device_type, asset.vendor, asset.model, asset.name, asset.hostname, asset.os,
+    org.name, org.holder, org.asn && `AS${org.asn}`, ...(asset.domains || []),
     m.name, m.location, m.owner, m.notes, CRIT_LABEL[m.criticality],
     asset.firmware, ...(asset.macs || []), ...(asset.protocols || [])].join(" ").toLowerCase();
 }
@@ -151,6 +159,7 @@ function render(snapshot) {
   renderAssetList(visibleAssets);
   renderAssetDetail(assets.find((asset) => asset.id === selectedId));
   renderAlerts(snapshot.alerts || []);
+  renderExternal(snapshot);
 }
 
 function renderStatus(sensor) {
@@ -236,6 +245,23 @@ function pointsDetail(asset) {
   return `<div class="detail-item"><span>공정 포인트 (쓰기 값·측정값)</span><ul class="point-list">${rows}</ul>${more}</div>`;
 }
 
+function levelOf(score) {
+  return score >= 70 ? ["lv-danger", "위험"] : score >= 30 ? ["lv-warn", "주의"] : score > 0 ? ["lv-note", "참고"] : ["lv-ok", "정상"];
+}
+
+function externalDetail(asset) {
+  if (!asset.org && !(asset.domains || []).length) return "";
+  const ext = (latestSnapshot.external || []).find((e) => e.id === asset.id);
+  const org = asset.org;
+  const orgLine = org ? `${escapeHtml(org.name)}${org.well_known ? ' <span class="well">잘 알려진 조직</span>' : ""}
+      <small>AS${org.asn} · ${escapeHtml(org.holder)} · ${escapeHtml(org.country)}</small>` : "조직 정보 없음";
+  const [cls, label] = levelOf(ext ? ext.score : 0);
+  return `<div class="detail-item ext-org"><span>외부 주소 소유 조직</span><strong>${orgLine}</strong></div>
+    ${(asset.domains || []).length ? detailItem("접속에 쓰인 이름 (DNS·SNI·Host)", asset.domains.join(", ")) : ""}
+    ${ext ? `<div class="detail-item"><span>외부 통신 판단</span><strong><span class="ext-level ${cls}">${label}</span></strong>
+      ${ext.reasons.length ? `<small class="ext-reasons">${ext.reasons.map(escapeHtml).join("<br>")}</small>` : ""}</div>` : ""}`;
+}
+
 function vulnDetail(asset) {
   const vulns = asset.vulns || [];
   if (!vulns.length) return "";
@@ -249,7 +275,7 @@ function vulnDetail(asset) {
   return `<div class="detail-item"><span>취약점 (위험도 ${asset.risk.toFixed(1)})</span><ul class="vuln-list">${items}</ul>${more}</div>`;
 }
 
-const SOURCE_TAG = { policy: "정책", baseline: "이탈", anomaly: "통계" };
+const SOURCE_TAG = { policy: "정책", baseline: "이탈", anomaly: "통계", external: "외부" };
 
 /** Learned behaviour of a conversation, e.g. "학습: 요청 주기 1.0초 ±0.1 · 분당 60건". */
 function profileText(profile) {
@@ -308,6 +334,7 @@ function renderAssetDetail(asset) {
         ${asset.manual && asset.manual.location ? detailItem("위치", asset.manual.location) : ""}
         ${asset.manual && asset.manual.owner ? detailItem("담당자", asset.manual.owner) : ""}
         ${asset.manual && asset.manual.notes ? `<div class="detail-item"><span>메모</span><strong class="notes">${escapeHtml(asset.manual.notes)}</strong></div>` : ""}
+        ${externalDetail(asset)}
         ${detailItem("컴퓨터 이름", asset.hostname)}
         ${asset.manual && asset.manual.os ? identityItem(asset, "운영체제", "os")
           : asset.os ? `<div class="detail-item"><span>운영체제 (수동 추정 ${Math.round(asset.os_confidence * 100)}%)</span><strong>${escapeHtml(asset.os)}</strong><small class="os-evidence">${escapeHtml(asset.os_evidence)}</small></div>` : ""}
@@ -437,6 +464,52 @@ async function setMode(mode, reset = false) {
   await loadSnapshot();
 }
 
+const externalFilter = document.getElementById("external-filter");
+const externalBody = document.getElementById("external-body");
+
+function formatPackets(n) {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(0)}k` : n.toLocaleString();
+}
+
+function renderExternal(snapshot) {
+  const rows = (snapshot.external || []).filter((e) => {
+    if (externalFilter.value === "flagged") return e.score >= 30;
+    if (externalFilter.value === "unknown") return !(e.org && e.org.well_known);
+    return true;
+  });
+  const intel = snapshot.intel || {};
+  const all = snapshot.external || [];
+  const flagged = all.filter((e) => e.score >= 30).length;
+  document.getElementById("external-info").textContent =
+    `인터넷 주소 ${all.length.toLocaleString()}곳 · 주의 이상 ${flagged}곳 · `
+    + (intel.asn ? `조직 DB ${intel.asn.ranges.toLocaleString()} 범위` : "조직 DB 없음 (tools/ipasn_build.py)")
+    + " · " + (intel.blocklist ? `위협 목록 ${intel.blocklist.entries.toLocaleString()}건` : "위협 목록 없음 (tools/threatintel_build.py)");
+  if (!rows.length) {
+    setHtml(externalBody, `<tr><td colspan="7" class="empty-row">${all.length ? "조건에 맞는 외부 통신이 없습니다." : "아직 인터넷 주소와의 통신이 관측되지 않았습니다."}</td></tr>`);
+    return;
+  }
+  setHtml(externalBody, rows.slice(0, 300).map((e) => {
+    const [cls, label] = levelOf(e.score);
+    const org = e.org ? `<b>${escapeHtml(e.org.name)}</b>${e.org.well_known ? '<span class="well">잘 알려진</span>' : ""}
+        <small>AS${e.org.asn} · ${escapeHtml(e.org.country)}</small>` : '<span class="muted">조직 정보 없음</span>';
+    const names = e.domains.length ? `<small>${escapeHtml(e.domains.slice(-3).join(", "))}</small>` : "";
+    const services = e.services.map((s) => `<span class="svc ${s.inbound ? "in" : ""}" title="${s.inbound ? (s.accepted ? "인터넷에서 접속, 내부가 응답함" : "인터넷에서 접속 시도") : "내부에서 접속"}">
+        ${s.inbound ? "↘ " : ""}${s.port}/${s.tcp ? "TCP" : "UDP"}${s.name ? ` ${escapeHtml(s.name)}` : ""}</span>`).join("");
+    const peers = e.peers.map((p) => `<a data-id="${escapeHtml(p)}">${escapeHtml(labelOf(p))}</a>`).join(", ")
+      + (e.peer_count > e.peers.length ? ` 외 ${e.peer_count - e.peers.length}` : "");
+    return `<tr>
+      <td><span class="ext-level ${cls}" title="점수 ${e.score}">${label}</span>
+        ${e.reasons.length ? `<small class="ext-reasons">${e.reasons.slice(0, 4).map(escapeHtml).join("<br>")}</small>` : ""}</td>
+      <td class="mono"><a data-id="${escapeHtml(e.id)}">${escapeHtml(e.ip)}</a>${e.threat ? ' <span class="kev">위협 목록</span>' : ""}</td>
+      <td class="ext-org">${org}${names}</td>
+      <td class="mono">${peers}</td>
+      <td>${services}</td>
+      <td class="mono">${formatPackets(e.packets_out)} / ${formatPackets(e.packets_in)}</td>
+      <td class="mono">${escapeHtml(formatTime(e.last_seen))}</td>
+    </tr>`;
+  }).join(""));
+}
+
 function renderAlerts(alerts) {
   const source = alertSource.value;
   const rows = alerts.filter((a) => (showAcked.checked || a.status === "new") && (!source || a.source === source));
@@ -483,6 +556,7 @@ searchInput.addEventListener("input", () => render(latestSnapshot));
 showAcked.addEventListener("change", () => render(latestSnapshot));
 alertSource.addEventListener("change", () => render(latestSnapshot));
 vulnLevel.addEventListener("change", () => render(latestSnapshot));
+externalFilter.addEventListener("change", () => render(latestSnapshot));
 document.getElementById("vulndb-input").addEventListener("change", async (event) => {
   const file = event.target.files[0];
   event.target.value = "";

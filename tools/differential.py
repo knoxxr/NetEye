@@ -38,9 +38,11 @@ STAT_FIELDS = ["frames", "dissected", "asset_count", "ot_asset_count", "link_cou
 def normalize(snap: dict) -> dict:
     # Statistical anomaly alerts exist only in the Rust sensor (the reference engine predates them):
     # compare everything else, and recount the open-alert stats without them.
-    anomaly = [a for a in snap["alerts"] if a.get("source") == "anomaly"]
+    # The same holds for internet-connection alerts (threat lists, exposure, OT devices online).
+    rust_only = ("anomaly", "external")
+    anomaly = [a for a in snap["alerts"] if a.get("source") in rust_only]
     if anomaly:
-        snap = {**snap, "alerts": [a for a in snap["alerts"] if a.get("source") != "anomaly"],
+        snap = {**snap, "alerts": [a for a in snap["alerts"] if a.get("source") not in rust_only],
                 "stats": {**snap["stats"],
                           "alert_open": snap["stats"]["alert_open"] - sum(a["status"] == "new" for a in anomaly),
                           "alert_critical": snap["stats"]["alert_critical"] - sum(

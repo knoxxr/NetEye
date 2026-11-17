@@ -380,7 +380,7 @@ fn browser(p: &[u8]) -> Option<HostInfo> {
 // ------------------------------------------------------------------ mDNS / LLMNR
 
 /// A DNS name at `off` (with compression); returns the name and the offset after it.
-fn dns_name(p: &[u8], mut off: usize) -> Option<(String, usize)> {
+pub(crate) fn dns_name(p: &[u8], mut off: usize) -> Option<(String, usize)> {
     let mut labels: Vec<String> = Vec::new();
     let mut end = None;
     for _ in 0..32 {

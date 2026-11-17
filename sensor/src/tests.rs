@@ -1144,3 +1144,149 @@ fn a_full_point_table_still_reports_writes_to_unknown_addresses() {
     assert_eq!(sweep["details"]["points"], json!(["u3 HR7"]));
     assert_eq!(e.points.len(), crate::engine::MAX_POINTS, "nothing more is stored");
 }
+
+// ------------------------------------------------------------ internet edge
+fn dns_response(name: &str, addr: &str) -> Vec<u8> {
+    let mut p = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    for label in name.split('.') {
+        p.push(label.len() as u8);
+        p.extend(label.as_bytes());
+    }
+    p.extend([0, 0, 1, 0, 1, 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+    p.extend(ip(addr));
+    udp_full("10.0.0.1", "10.0.0.20", 53, 53000, &p, PLC_MAC, HMI_MAC)
+}
+
+fn client_hello(sni: &str) -> Vec<u8> {
+    let name = sni.as_bytes();
+    let mut ext = vec![0, 0];
+    ext.extend(((name.len() + 5) as u16).to_be_bytes());
+    ext.extend(((name.len() + 3) as u16).to_be_bytes());
+    ext.push(0);
+    ext.extend((name.len() as u16).to_be_bytes());
+    ext.extend(name);
+    let mut hello = vec![3, 3];
+    hello.extend([7u8; 32]);
+    hello.extend([0, 0, 2, 0x13, 0x01, 1, 0]);
+    hello.extend((ext.len() as u16).to_be_bytes());
+    hello.extend(ext);
+    let mut hs = vec![1, 0];
+    hs.extend((hello.len() as u16).to_be_bytes());
+    hs.extend(hello);
+    let mut rec = vec![0x16, 3, 1];
+    rec.extend((hs.len() as u16).to_be_bytes());
+    rec.extend(hs);
+    rec
+}
+
+fn externals(s: &Value) -> HashMap<String, Value> {
+    s["external"].as_array().unwrap().iter().map(|x| (x["ip"].as_str().unwrap().to_string(), x.clone())).collect()
+}
+
+fn ext_titles(s: &Value) -> Vec<String> {
+    s["alerts"].as_array().unwrap().iter().filter(|a| a["source"] == "external")
+        .map(|a| a["title"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn internet_destinations_get_names_and_services() {
+    let s = run(&[
+        dns_response("update.example.com", "8.8.4.4"),
+        tcp_full("10.0.0.20", "8.8.4.4", 51000, 443, &[], HMI_MAC, PLC_MAC, 0x02),
+        tcp_full("8.8.4.4", "10.0.0.20", 443, 51000, &[], PLC_MAC, HMI_MAC, 0x12),
+        tcp_full("10.0.0.20", "9.9.9.9", 51001, 443, &client_hello("api.example.net"), HMI_MAC, PLC_MAC, 0x18),
+        tcp_full("10.0.0.20", "1.1.1.1", 51002, 7777, &[], HMI_MAC, PLC_MAC, 0x02),
+    ]);
+    let ext = externals(&s);
+    assert_eq!(ext["8.8.4.4"]["domains"], json!(["update.example.com"]));
+    assert_eq!(ext["8.8.4.4"]["services"][0]["name"], "HTTPS");
+    assert_eq!(ext["8.8.4.4"]["peers"], json!(["10.0.0.20"]));
+    assert_eq!(ext["9.9.9.9"]["domains"], json!(["api.example.net"]));
+    assert_eq!(by_label(&s)["8.8.4.4"]["domains"], json!(["update.example.com"]));
+    // A nameless destination on an unusual port is flagged, an ordinary HTTPS one is not.
+    let odd = ext["1.1.1.1"]["reasons"].as_array().unwrap();
+    assert!(odd.contains(&json!("비표준 포트 7777/TCP")) && odd.contains(&json!("DNS·SNI 이름 없이 직접 접속")));
+    assert!(ext["8.8.4.4"]["reasons"].as_array().unwrap().is_empty());
+    assert!(ext_titles(&s).is_empty(), "ordinary browsing raises no alert");
+}
+
+#[test]
+fn risky_internet_conversations_raise_alerts() {
+    let mut e = Engine::new();
+    let path = std::env::temp_dir().join(format!("neteye-bl-test-{}.txt", std::process::id()));
+    std::fs::write(&path, "5.6.7.8 # Feodo Tracker\n").unwrap();
+    e.set_intel(None, Some(Arc::new(crate::intel::Blocklist::load(&path).unwrap())));
+    let _ = std::fs::remove_file(&path);
+    feed(&mut e, &[
+        // A PLC (Modbus server) that also talks to the internet.
+        tcp("10.0.0.20", "10.0.0.10", 50000, 502, &mbap(1, &[3, 0, 0, 0, 1])),
+        tcp_full("10.0.0.10", "4.4.4.4", 50100, 443, &[], PLC_MAC, HMI_MAC, 0x02),
+        // Modbus across the internet.
+        tcp_full("10.0.0.20", "4.2.2.2", 50001, 502, &mbap(1, &[3, 0, 0, 0, 1]), HMI_MAC, PLC_MAC, 0x18),
+        // Remote desktop opened from the internet and accepted.
+        tcp_full("1.2.3.4", "10.0.0.30", 40000, 3389, &[], PLC_MAC, HMI_MAC, 0x02),
+        tcp_full("10.0.0.30", "1.2.3.4", 3389, 40000, &[], HMI_MAC, PLC_MAC, 0x12),
+        // A host on a threat list.
+        tcp_full("10.0.0.20", "5.6.7.8", 50002, 443, &[], HMI_MAC, PLC_MAC, 0x02),
+        // A voice call: UDP between temporary ports, started by the outside peer. Not inbound access.
+        udp_full("3.3.3.3", "10.0.0.40", 41210, 49480, &[0u8; 40], PLC_MAC, HMI_MAC),
+        udp_full("10.0.0.40", "3.3.3.3", 49480, 41210, &[0u8; 40], HMI_MAC, PLC_MAC),
+        // Mid-stream TCP data from inside to an outside client port is not "accepting" anything.
+        tcp_full("10.0.0.41", "3.3.3.4", 8080, 50500, &[1, 2, 3], HMI_MAC, PLC_MAC, 0x18),
+    ], T0);
+    e.emit_events = true;
+    let s = snap(&mut e);
+    let titles = ext_titles(&s);
+    for t in ["OT 장비의 인터넷 통신", "산업 프로토콜의 인터넷 통신", "인터넷에서 내부 서비스로 접속", "위협 인텔리전스 목록 주소와 통신"] {
+        assert!(titles.contains(&t.to_string()), "{t} in {titles:?}");
+    }
+    let alerts: HashMap<String, Value> = s["alerts"].as_array().unwrap().iter()
+        .map(|a| (a["title"].as_str().unwrap().to_string(), a.clone())).collect();
+    assert_eq!(alerts["인터넷에서 내부 서비스로 접속"]["severity"], "critical", "RDP from the internet");
+    assert_eq!(alerts["인터넷에서 내부 서비스로 접속"]["src"], "1.2.3.4");
+    assert_eq!(alerts["인터넷에서 내부 서비스로 접속"]["count"], 1, "only the accepted RDP session");
+    assert_eq!(alerts["위협 인텔리전스 목록 주소와 통신"]["details"]["threat_list"], "Feodo Tracker");
+    let ext = externals(&s);
+    assert_eq!(ext["5.6.7.8"]["score"], 100);
+    assert_eq!(s["external"][0]["ip"], "5.6.7.8", "most suspicious first");
+}
+
+#[test]
+fn site_networks_numbered_from_public_space_stay_internal() {
+    let mut e = Engine::new();
+    e.set_internal_nets(&["166.161.0.0/16".to_string()]).unwrap();
+    feed(&mut e, &[tcp("166.161.16.20", "166.161.16.230", 50000, 502, &mbap(1, &[3, 0, 0, 0, 1]))], T0);
+    let s = snap(&mut e);
+    assert!(s["external"].as_array().unwrap().is_empty());
+    assert!(ext_titles(&s).is_empty());
+}
+
+#[test]
+fn ephemeral_source_ports_are_not_fieldbus_signatures() {
+    let s = run(&[
+        // A PC whose random source port happens to be 61450 (DNS) / 61451 (QUIC).
+        udp_full("10.0.0.20", "8.8.8.8", 61450, 53, &[0u8; 30], HMI_MAC, PLC_MAC),
+        udp_full("10.0.0.20", "142.250.1.1", 61451, 443, &[0u8; 30], HMI_MAC, PLC_MAC),
+        // A real CC-Link IE Field Basic exchange between two stations.
+        udp_full("10.0.1.5", "10.0.1.6", 61450, 61450, &[0u8; 30], "00:1b:1b:00:00:05", "00:1b:1b:00:00:06"),
+    ]);
+    let a = by_label(&s);
+    assert_eq!(a["10.0.0.20"]["device_type"], "Unknown");
+    assert!(!strs(&a["10.0.0.20"]["protocols"]).contains(&"CC-Link IE Field Basic".to_string()));
+    assert_eq!(a["10.0.1.6"]["device_type"], "CC-Link IE Field Basic station");
+}
+
+#[test]
+fn hosts_misread_by_earlier_versions_are_reset_on_load() {
+    let mut e = Engine::new();
+    let asset = |id: &str, kind: &str| json!({"id": id, "ip": id, "device_type": kind, "confidence": 0.7,
+        "protocols": ["CC-Link IE Field Basic", "UDP"], "first_seen": "2026-11-17T00:00:00.000+00:00",
+        "last_seen": "2026-11-17T00:00:00.000+00:00"});
+    let link = |a: &str, b: &str| json!({"source": a, "target": b, "protocol": "UDP", "packets": 1});
+    e.restore(vec![asset("10.0.0.20", "CC-Link IE Field Basic station"), asset("10.0.1.6", "CC-Link IE Field Basic station"),
+                   asset("8.8.8.8", "Unknown")],
+              vec![link("10.0.0.20", "8.8.8.8"), link("10.0.1.5", "10.0.1.6")], Vec::new(), None, Vec::new());
+    let a = by_label(&snap(&mut e));
+    assert_eq!(a["10.0.0.20"]["device_type"], "Unknown", "the PC that browses the internet is corrected");
+    assert_eq!(a["10.0.1.6"]["device_type"], "CC-Link IE Field Basic station", "a real station is left alone");
+}

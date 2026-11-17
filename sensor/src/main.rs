@@ -16,6 +16,7 @@ mod decode;
 mod dissect;
 mod engine;
 mod guard;
+mod intel;
 mod live;
 mod osfp;
 mod pcap;
@@ -39,6 +40,9 @@ pub struct Config {
     pub port: u16,
     pub db_path: PathBuf,
     pub vulndb_path: PathBuf,
+    pub ipasn_path: PathBuf,
+    pub blocklist_path: PathBuf,
+    pub internal_nets: Vec<String>,
     pub frontend: PathBuf,
     pub interface: Option<String>,
     pub max_pcap_bytes: usize,
@@ -70,6 +74,10 @@ impl Config {
             port: env("NETEYE_PORT").and_then(|p| p.parse().ok()).unwrap_or(8000),
             db_path: env("NETEYE_DB").map(PathBuf::from).unwrap_or_else(|| root.join("data").join("neteye.bdb")),
             vulndb_path: env("NETEYE_VULNDB").map(PathBuf::from).unwrap_or_else(|| root.join("data").join("vulndb.json")),
+            ipasn_path: env("NETEYE_IPASN").map(PathBuf::from).unwrap_or_else(|| root.join("data").join("ip2asn-v4.tsv.gz")),
+            blocklist_path: env("NETEYE_BLOCKLIST").map(PathBuf::from).unwrap_or_else(|| root.join("data").join("blocklist.txt")),
+            internal_nets: env("NETEYE_INTERNAL_NETS").map(|v| v.split(',').map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
             frontend: env("NETEYE_FRONTEND").map(PathBuf::from).unwrap_or_else(|| root.join("frontend")),
             interface: env("NETEYE_INTERFACE"),
             max_pcap_bytes: env("NETEYE_MAX_PCAP_MB").and_then(|v| v.parse::<usize>().ok()).unwrap_or(512) << 20,
@@ -103,6 +111,32 @@ pub fn import_file(engine: &Mutex<Engine>, path: &Path, mut progress: impl FnMut
     });
     progress(count);
     stats
+}
+
+/// Offline address intelligence: IP-to-organisation database, threat lists, internal networks.
+fn load_intel(engine: &mut Engine, config: &Config) -> Result<(), String> {
+    let asn = match intel::AsnDb::load(&config.ipasn_path) {
+        Ok(db) => {
+            println!("IP 조직 DB: {} 범위 ({})", db.len(), config.ipasn_path.display());
+            Some(Arc::new(db))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("IP 조직 DB 없음: python tools/ipasn_build.py 로 만들 수 있습니다 ({})", config.ipasn_path.display());
+            None
+        }
+        Err(e) => return Err(format!("{}: {e}", config.ipasn_path.display())),
+    };
+    let blocklist = match intel::Blocklist::load(&config.blocklist_path) {
+        Ok(bl) => {
+            println!("위협 목록: {}개 ({})", bl.len(), bl.sources().join(", "));
+            Some(Arc::new(bl))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", config.blocklist_path.display())),
+    };
+    engine.set_intel(asn, blocklist);
+    engine.set_internal_nets(&config.internal_nets)?;
+    Ok(())
 }
 
 fn load_vulndb(path: &Path) -> Result<Option<Arc<vulns::VulnDb>>, String> {
@@ -430,6 +464,7 @@ fn serve() -> Result<(), String> {
         Ok(db) => { engine.set_vulndb(db); None }
         Err(e) => Some(e),
     };
+    load_intel(&mut engine, &config)?;
     let engine = Arc::new(Mutex::new(engine));
     let env_str = |n: &str| env(n);
     let forwarder = siem::Forwarder::from_settings(env_str("NETEYE_SYSLOG").as_deref(),
