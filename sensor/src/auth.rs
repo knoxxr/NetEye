@@ -159,10 +159,10 @@ fn expired(s: &Session, now: Instant) -> bool {
 /// - per account: ACCOUNT_FAILURES failures from anywhere within ACCOUNT_WINDOW put the account
 ///   under guard for LOCKOUT, during which only clients that signed in to it before may try.
 ///
-/// Real accounts and made-up names live in separate tables. Made-up names follow the same
-/// schedule (so lockouts reveal nothing about which accounts exist), but their table evicts the
-/// least recently used entry when full and can never crowd out a real account. If the table for
-/// real accounts is ever full, the account is put under guard instead (fail closed).
+/// Real and made-up names are treated identically in everything a client can observe, so
+/// lockouts reveal nothing about which accounts exist. Entries with an active lock are never
+/// evicted; when a table is full, plain counters go first (made-up names before real ones). If a
+/// table is full of active locks, every name is guarded for untrusted clients (fail closed).
 #[derive(Default)]
 pub struct Throttle {
     state: Mutex<ThrottleState>,
@@ -170,16 +170,12 @@ pub struct Throttle {
 
 #[derive(Default)]
 struct ThrottleState {
-    real: Ledger,
-    unknown: Ledger,
-    /// account -> clients that signed in successfully (most recent last)
-    trusted: HashMap<String, Vec<String>>,
-}
-
-#[derive(Default)]
-struct Ledger {
     pairs: HashMap<(String, String), Count>,
     accounts: HashMap<String, Count>,
+    /// account -> clients that signed in successfully (most recent last)
+    trusted: HashMap<String, Vec<String>>,
+    /// Set when a table could not record a failure: untrusted clients wait for every name.
+    saturated_until: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -188,11 +184,12 @@ struct Count {
     since: Instant,
     until: Option<Instant>,
     touched: Instant,
+    real: bool,
 }
 
 impl Count {
-    fn new(now: Instant) -> Count {
-        Count { failures: 0, since: now, until: None, touched: now }
+    fn new(now: Instant, real: bool) -> Count {
+        Count { failures: 0, since: now, until: None, touched: now, real }
     }
     fn active(&self, now: Instant) -> Option<Duration> {
         self.until.and_then(|u| u.checked_duration_since(now))
@@ -202,7 +199,7 @@ impl Count {
 const ACCOUNT_FAILURES: u32 = 20;
 const ACCOUNT_WINDOW: Duration = Duration::from_secs(15 * 60);
 const THROTTLE_PAIRS: usize = 10_000;
-const THROTTLE_UNKNOWN_ACCOUNTS: usize = 10_000;
+const THROTTLE_ACCOUNTS: usize = 10_000;
 const TRUSTED_PER_ACCOUNT: usize = 16;
 
 /// IPv6 clients are counted per /64, the block one subscriber usually controls.
@@ -217,10 +214,19 @@ pub fn client_bucket(ip: &str) -> String {
     }
 }
 
-/// Drop the least recently touched entry (made-up names only).
-fn evict_oldest<K: Clone + std::hash::Hash + Eq>(map: &mut HashMap<K, Count>) {
-    if let Some(key) = map.iter().min_by_key(|(_, c)| c.touched).map(|(k, _)| k.clone()) {
-        map.remove(&key);
+/// Make room for one entry: drop the least recently used counter without an active lock (made-up
+/// names first). Returns false when every entry is actively locked.
+fn make_room<K: Clone + std::hash::Hash + Eq>(map: &mut HashMap<K, Count>, now: Instant) -> bool {
+    let victim = map.iter()
+        .filter(|(_, c)| c.active(now).is_none())
+        .min_by_key(|(_, c)| (c.real, c.touched))
+        .map(|(k, _)| k.clone());
+    match victim {
+        Some(key) => {
+            map.remove(&key);
+            true
+        }
+        None => false,
     }
 }
 
@@ -231,27 +237,27 @@ impl Throttle {
         let st = self.state.lock();
         let now = Instant::now();
         let trusted = st.trusted.get(username).is_some_and(|c| c.contains(&client));
-        let key = (username.to_string(), client);
-        [&st.real, &st.unknown].iter().filter_map(|ledger| {
-            let pair = ledger.pairs.get(&key).and_then(|c| c.active(now));
-            let guard = ledger.accounts.get(username).and_then(|c| c.active(now)).filter(|_| !trusted);
-            pair.max(guard)
-        }).max()
+        let pair = st.pairs.get(&(username.to_string(), client)).and_then(|c| c.active(now));
+        let guard = st.accounts.get(username).and_then(|c| c.active(now))
+            .or_else(|| st.saturated_until.and_then(|u| u.checked_duration_since(now)))
+            .filter(|_| !trusted);
+        pair.max(guard)
     }
 
-    /// A failed sign-in. `exists` picks the table; the visible schedule is the same either way.
+    /// A failed sign-in. `exists` only decides eviction order among unlocked counters.
     pub fn failure(&self, username: &str, client: &str, exists: bool) {
         let client = client_bucket(client);
         let mut st = self.state.lock();
         let now = Instant::now();
-        let ledger = if exists { &mut st.real } else { &mut st.unknown };
 
-        if !exists && !ledger.accounts.contains_key(username) && ledger.accounts.len() >= THROTTLE_UNKNOWN_ACCOUNTS {
-            evict_oldest(&mut ledger.accounts);
+        if !st.accounts.contains_key(username) && st.accounts.len() >= THROTTLE_ACCOUNTS
+            && !make_room(&mut st.accounts, now) {
+            st.saturated_until = Some(now + LOCKOUT);
+            return;
         }
-        let account = ledger.accounts.entry(username.to_string()).or_insert_with(|| Count::new(now));
+        let account = st.accounts.entry(username.to_string()).or_insert_with(|| Count::new(now, exists));
         if now.duration_since(account.since) > ACCOUNT_WINDOW {
-            *account = Count { until: account.until.filter(|u| *u > now), ..Count::new(now) };
+            *account = Count { until: account.until.filter(|u| *u > now), ..Count::new(now, account.real) };
         }
         account.failures += 1;
         account.touched = now;
@@ -260,24 +266,13 @@ impl Throttle {
         }
 
         let key = (username.to_string(), client);
-        if !ledger.pairs.contains_key(&key) && ledger.pairs.len() >= THROTTLE_PAIRS {
-            if exists {
-                ledger.pairs.retain(|_, c| c.active(now).is_some());
-                if ledger.pairs.len() >= THROTTLE_PAIRS {
-                    // Cannot count this client: fail closed by guarding the account (known clients
-                    // can still sign in).
-                    if let Some(account) = ledger.accounts.get_mut(username) {
-                        account.until = Some(now + LOCKOUT);
-                    }
-                    return;
-                }
-            } else {
-                evict_oldest(&mut ledger.pairs);
-            }
+        if !st.pairs.contains_key(&key) && st.pairs.len() >= THROTTLE_PAIRS && !make_room(&mut st.pairs, now) {
+            st.saturated_until = Some(now + LOCKOUT);
+            return;
         }
-        let pair = ledger.pairs.entry(key).or_insert_with(|| Count::new(now));
+        let pair = st.pairs.entry(key).or_insert_with(|| Count::new(now, exists));
         if pair.until.is_some_and(|u| u <= now) {
-            *pair = Count::new(now); // previous lock elapsed: start counting again
+            *pair = Count::new(now, pair.real); // previous lock elapsed: start counting again
         }
         pair.failures += 1;
         pair.touched = now;
@@ -289,7 +284,7 @@ impl Throttle {
     pub fn success(&self, username: &str, client: &str) {
         let client = client_bucket(client);
         let mut st = self.state.lock();
-        st.real.pairs.remove(&(username.to_string(), client.clone()));
+        st.pairs.remove(&(username.to_string(), client.clone()));
         let trusted = st.trusted.entry(username.to_string()).or_default();
         trusted.retain(|c| *c != client);
         trusted.push(client);
@@ -412,7 +407,7 @@ mod tests {
         for i in 0..(THROTTLE_PAIRS + 50) {
             throttle.failure(&format!("fake{i}"), "10.0.0.9", false);
         }
-        assert!(throttle.state.lock().unknown.pairs.len() <= THROTTLE_PAIRS);
+        assert!(throttle.state.lock().pairs.len() <= THROTTLE_PAIRS);
         for _ in 0..MAX_FAILURES {
             throttle.failure("admin", "10.0.0.9", true);
         }
