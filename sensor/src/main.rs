@@ -466,7 +466,7 @@ fn serve() -> Result<(), String> {
     };
     load_intel(&mut engine, &config)?;
     // One-time corrections of data written by earlier versions (after the network settings above).
-    let marker = config.db_path.with_extension("migrated-v1");
+    let marker = config.db_path.with_extension("migrated-v2");
     if !marker.exists() {
         engine.run_migrations();
         if let Err(e) = std::fs::write(&marker, "ephemeral-port misidentification, P2P inbound alerts\n") {
