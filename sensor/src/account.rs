@@ -141,8 +141,9 @@ pub async fn login(State(s): State<Arc<AppState>>, Extension(ClientIp(ip)): Exte
         Some(u) => (auth::verify_password(&password, &u.password_hash), Some(u)),
         None => { auth::verify_dummy(&password); (false, None) }
     }).await.unwrap();
+    let exists = user.is_some();
     let Some(user) = user.filter(|_| ok) else {
-        s.throttle.failure(&username, &ip);
+        s.throttle.failure(&username, &ip, exists);
         s.audit(&username, &ip, "login", 401, "invalid credentials");
         return error(StatusCode::UNAUTHORIZED, "사용자 이름 또는 비밀번호가 올바르지 않습니다");
     };

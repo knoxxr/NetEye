@@ -144,8 +144,11 @@ pub struct ManualInfo {
 pub const MAX_POINTS: usize = 100_000;
 /// Read requests waiting for their response.
 const MAX_PENDING_READS: usize = 4096;
-/// Individual "unlearned address" alerts per client/server before they are summarised.
+/// Individual "unlearned address" alerts per client/server and window before they are summarised.
 const NEW_POINT_ALERTS: u32 = 20;
+const NEW_POINT_WINDOW_MS: i64 = 10 * 60 * 1000;
+/// Addresses listed by name in a summary alert (the rest are counted).
+const SUMMARY_POINTS: usize = 200;
 
 pub const CRITICALITY: [&str; 5] = ["", "low", "medium", "high", "critical"];
 
@@ -330,8 +333,8 @@ pub struct Engine {
     mac_ips: FxHashMap<u64, Vec<u32>>,
     /// DHCP names/OS for clients not yet seen with an address, applied when their MAC shows up.
     pending_hosts: FxHashMap<u64, osfp::HostInfo>,
-    /// New-point alerts raised per (client, server), to fold a write sweep into one alert.
-    new_point_alerts: FxHashMap<(AssetKey, AssetKey), u32>,
+    /// New-point alerts per (client, server) in the current window: (count, window start).
+    new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64)>,
     conversations: FxHashMap<(AssetKey, AssetKey, &'static str), Sym>,
     next_alert_id: u64,
     dirty_assets: Vec<AssetKey>,
@@ -476,16 +479,29 @@ impl Engine {
     fn observe_values(&mut self, client: AssetKey, server: AssetKey, proto: Sym, values: &[PointValue],
                       operation: &str, category: &'static str, now: i64) {
         let learning = self.learning;
+        let fmt = |x: f64| if x.fract() == 0.0 && x.abs() < 1e15 { Value::from(x as i64) } else { Value::from(x) };
         for v in values {
-            // Once the table is full, addresses not seen before are neither named nor tracked:
-            // an address scan cannot grow memory (points, names, alerts) without bound.
             let full = self.points.len() >= MAX_POINTS;
-            let point = match self.point_syms.get(&v.point) {
-                Some(&sym) => sym,
-                None if full => continue,
+            let cached = self.point_syms.get(&v.point).copied();
+            let tracked = cached.is_some_and(|point| {
+                self.points.contains_key(&PointKey { server, proto, point, measured: v.measured })
+            });
+            if full && !tracked {
+                // The table is full: the address is not learned or stored, but a write to it is still
+                // reported (fail closed), and the operator is told that tracking hit its limit.
+                self.point_alert("high", "공정 포인트 추적 한도 도달", vec![("limit".into(), Value::from(MAX_POINTS))],
+                                 proto, operation, category, client, server, now);
+                if !v.measured && !learning {
+                    self.new_point_alert(client, server, proto, operation, category, v.point.to_string(),
+                                         fmt(v.value), now, true);
+                }
+                continue;
+            }
+            let point = match cached {
+                Some(sym) => sym,
                 None => {
                     if self.point_syms.len() >= 200_000 {
-                        self.point_syms.clear(); // bound memory against address scans
+                        self.point_syms.clear(); // name cache only; names stay interned
                     }
                     let sym = self.sym_fmt(format_args!("{}", v.point));
                     self.point_syms.insert(v.point.clone(), sym);
@@ -493,9 +509,6 @@ impl Engine {
                 }
             };
             let key = PointKey { server, proto, point, measured: v.measured };
-            if full && !self.points.contains_key(&key) {
-                continue;
-            }
             let profile = self.points.entry(key).or_default();
             let anomaly = profile.observe_kind(v.value, v.discrete, learning, now, v.measured);
             if !profile.dirty {
@@ -504,7 +517,6 @@ impl Engine {
             }
             let Some(anomaly) = anomaly else { continue };
             let name = self.syms.get(point).to_string();
-            let fmt = |x: f64| if x.fract() == 0.0 && x.abs() < 1e15 { Value::from(x as i64) } else { Value::from(x) };
             let (severity, title, details): (&'static str, String, Vec<(String, Value)>) = match (anomaly, v.measured) {
                 (PointAnomaly::Range { value, min, max }, measured) => (
                     if measured { "medium" } else { "high" },
@@ -516,20 +528,63 @@ impl Engine {
                     vec![("value".into(), fmt(value)),
                          ("learned_values".into(), Value::Array(states.into_iter().map(fmt).collect()))]),
                 (PointAnomaly::NewPoint { value }, _) => {
-                    // One alert per address for the first few, then a single summary per client/server
-                    // pair, so a write sweep cannot flood the alert list.
-                    let seen = self.new_point_alerts.entry((client, server)).or_insert(0);
-                    *seen += 1;
-                    let title = if *seen <= NEW_POINT_ALERTS { format!("학습되지 않은 주소에 쓰기: {name}") }
-                                else { "학습되지 않은 주소에 쓰기 (다수 주소)".to_string() };
-                    ("medium", title, vec![("value".into(), fmt(value)), ("point".into(), Value::from(name.clone()))])
+                    self.new_point_alert(client, server, proto, operation, category, name, fmt(value), now, false);
+                    continue;
                 }
             };
-            let title_sym = self.syms.intern(&title);
-            let op = self.syms.intern(operation);
-            self.alert(severity, title_sym, proto, op, client, Some(server), now, category, details, None);
-            if let Some(alert) = self.alerts.get_mut(&AlertKey { title: title_sym, src: client, dst: Some(server) }) {
-                alert.anomaly = true;
+            self.point_alert(severity, &title, details, proto, operation, category, client, server, now);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn point_alert(&mut self, severity: &'static str, title: &str, details: Vec<(String, Value)>, proto: Sym,
+                   operation: &str, category: &'static str, client: AssetKey, server: AssetKey, now: i64) -> AlertKey {
+        let title = self.syms.intern(title);
+        let op = self.syms.intern(operation);
+        self.alert(severity, title, proto, op, client, Some(server), now, category, details, None);
+        let key = AlertKey { title, src: client, dst: Some(server) };
+        if let Some(alert) = self.alerts.get_mut(&key) {
+            alert.anomaly = true;
+        }
+        key
+    }
+
+    /// Writes to addresses never seen while learning. The first few per client/server pair in a
+    /// 10-minute window get their own alert; beyond that (a write sweep) they go into one summary
+    /// alert that still lists every address (up to a bound) and counts every write.
+    #[allow(clippy::too_many_arguments)]
+    fn new_point_alert(&mut self, client: AssetKey, server: AssetKey, proto: Sym, operation: &str,
+                       category: &'static str, name: String, value: Value, now: i64, force_summary: bool) {
+        let window = self.new_point_alerts.entry((client, server)).or_insert((0, now));
+        if now - window.1 > NEW_POINT_WINDOW_MS {
+            *window = (0, now);
+        }
+        window.0 += 1;
+        if !force_summary && window.0 <= NEW_POINT_ALERTS {
+            let details = vec![("value".into(), value), ("point".into(), Value::from(name.clone()))];
+            self.point_alert("medium", &format!("학습되지 않은 주소에 쓰기: {name}"), details, proto, operation,
+                             category, client, server, now);
+            return;
+        }
+        let key = self.point_alert("high", "학습되지 않은 주소에 쓰기 (다수 주소)", vec![("value".into(), value)],
+                                   proto, operation, category, client, server, now);
+        if let Some(alert) = self.alerts.get_mut(&key) {
+            if !alert.details.iter().any(|(k, _)| k == "points") {
+                alert.details.push(("points".into(), Value::Array(Vec::new())));
+            }
+            let at = alert.details.iter().position(|(k, _)| k == "points").unwrap();
+            let Value::Array(points) = &mut alert.details[at].1 else { return };
+            let name = Value::from(name);
+            if points.contains(&name) {
+                return;
+            }
+            if points.len() < SUMMARY_POINTS {
+                points.push(name);
+            } else {
+                match alert.details.iter_mut().find(|(k, _)| k == "points_unlisted") {
+                    Some((_, n)) => *n = Value::from(n.as_u64().unwrap_or(0) + 1),
+                    None => alert.details.push(("points_unlisted".into(), Value::from(1u64))),
+                }
             }
         }
     }

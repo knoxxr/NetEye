@@ -425,7 +425,7 @@ REST/WebSocket API와 대시보드는 이전과 같습니다. Python 버전을 �
 ## 검증
 
 ```powershell
-cd sensor; cargo test --release                       # 테스트 69개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
+cd sensor; cargo test --release                       # 테스트 70개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
                                                       # (저장 테스트는 실제 인메모리 bangdb를 띄우므로 먼저 빌드 필요)
 python tools/differential.py <pcap 폴더> --vulndb vulndb.json   # Rust와 기준 엔진을 필드 단위로 비교
 ```
@@ -437,6 +437,11 @@ python tools/differential.py <pcap 폴더> --vulndb vulndb.json   # Rust와 기�
 
 ## 알려진 제약
 
+- 공정 포인트는 최대 10만 개까지 학습합니다. 가득 차면 새 주소는 저장하지 않지만 그 주소로의 쓰기는 계속 경고하고,
+  "공정 포인트 추적 한도 도달" 경고를 냅니다. 학습되지 않은 주소 쓰기는 같은 출발지·목적지 쌍마다 10분에 20건까지 개별
+  경고, 이후는 요약 경고(심각도 높음) 하나에 주소 목록(최대 200개, 나머지는 개수)과 횟수로 모입니다.
+- 로그인은 (계정, 접속 주소) 단위로 5회 실패 시 5분 잠깁니다. 한 계정에 15분간 20회 넘게 실패하면 5분간 그 계정에
+  이전에 로그인한 적 있는 주소에서만 시도할 수 있습니다. IPv6는 /64 단위로 셉니다.
 - 운영체제는 수동 추정입니다. 대부분 계열(Windows 10/11, Linux 등) 수준이고, 정확한 버전은 배너·User-Agent처럼
   장비가 직접 밝힐 때만 나옵니다. 컴퓨터 이름은 DHCP·NetBIOS·mDNS·LLMNR 패킷이 보일 때만 얻습니다.
 - TCP 재조립이 없습니다. 여러 세그먼트로 나뉜 PDU는 첫 세그먼트만 분석합니다.
