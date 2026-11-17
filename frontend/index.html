@@ -20,6 +20,11 @@
           센서 연결 대기
         </span>
         <span class="topbar-label">수동 모니터링</span>
+        <div class="user-menu">
+          <span id="user-badge" class="user-badge"></span>
+          <button id="btn-password" class="link-button" type="button">비밀번호 변경</button>
+          <button id="btn-logout" class="link-button" type="button">로그아웃</button>
+        </div>
       </div>
     </header>
 
@@ -32,7 +37,7 @@
         </div>
         <div class="heading-actions">
           <span id="import-status" class="import-status"></span>
-          <label class="button" title="pcap / pcapng 파일을 분석합니다">
+          <label class="button" data-min-role="operator" title="pcap / pcapng 파일을 분석합니다">
             <input id="pcap-input" type="file" accept=".pcap,.pcapng,.cap" hidden>
             PCAP 분석
           </label>
@@ -53,7 +58,7 @@
           <span><b id="bl-links">0</b> 통신</span>
           <span><b id="bl-ops">0</b> 명령</span>
         </div>
-        <div class="baseline-actions">
+        <div class="baseline-actions" data-min-role="admin">
           <button id="btn-detect" class="button">탐지 모드 시작</button>
           <select id="learn-hours" aria-label="학습 기간">
             <option value="">기간: 수동 종료</option>
@@ -82,6 +87,11 @@
           <strong id="stat-links">0</strong>
           <span class="stat-foot">클라이언트 → 서버</span>
         </article>
+        <article class="stat-card vuln-card">
+          <span class="stat-label">취약 자산</span>
+          <strong id="stat-vuln">0</strong>
+          <span class="stat-foot">KEV(악용 중) <span id="stat-kev">0</span>대</span>
+        </article>
         <article class="stat-card alert-card">
           <span class="stat-label">미확인 경고</span>
           <strong id="stat-alerts">0</strong>
@@ -101,16 +111,27 @@
               <input id="asset-search" type="search" placeholder="IP, 벤더, 모델, 유형 검색" autocomplete="off">
             </label>
           </div>
+          <div class="graph-options" role="group" aria-label="네트워크 맵 보기 옵션">
+            <label>배치
+              <select id="graph-mode">
+                <option value="group">서브넷 그룹</option>
+                <option value="purdue">Purdue 계층</option>
+                <option value="free">자유 배치</option>
+              </select>
+            </label>
+            <label><input type="checkbox" id="graph-external"> 외부 IP 묶기</label>
+            <label><input type="checkbox" id="graph-isolated"> 통신 없는 자산 숨기기</label>
+          </div>
           <div class="graph-wrap">
-            <svg id="topology" viewBox="0 0 960 520" role="img" aria-label="자산 통신 관계 그래프">
-              <defs>
-                <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                  <path d="M0,0 L8,4 L0,8 z" fill="#62748c"></path>
-                </marker>
-              </defs>
-              <g id="edges"></g>
-              <g id="nodes"></g>
-            </svg>
+            <canvas id="topology" role="img" aria-label="자산 통신 관계 그래프. 휠로 확대·축소, 드래그로 이동"></canvas>
+            <div class="graph-tooltip" hidden></div>
+            <div class="graph-controls" role="toolbar" aria-label="네트워크 맵 보기">
+              <button type="button" id="zoom-in" title="확대" aria-label="확대">+</button>
+              <button type="button" id="zoom-out" title="축소" aria-label="축소">−</button>
+              <button type="button" id="zoom-fit" title="전체 보기 (빈 곳 더블클릭)" aria-label="전체 보기">⤢</button>
+              <button type="button" id="flow-toggle" title="패킷 흐름 표시" aria-pressed="true">패킷</button>
+              <button type="button" id="graph-fullscreen" title="전체 화면 (Esc로 종료)" aria-label="전체 화면">⛶</button>
+            </div>
             <div id="empty-state" class="empty-state">
               <div class="empty-icon">⌁</div>
               <strong>아직 관측된 자산이 없습니다</strong>
@@ -124,6 +145,15 @@
             <span><i class="legend-dot industrial"></i> 기타 OT 장비</span>
             <span><i class="legend-dot unknown"></i> 미확인</span>
             <span><i class="legend-line"></i> 관측된 통신</span>
+            <span class="legend-heat" title="통신선 색과 굵기: 초당 패킷 수">트래픽
+              <i style="background:#6f8fc0"></i>1 미만
+              <i style="background:#45d6cb"></i>1–10
+              <i style="background:#f2d06b"></i>10–100
+              <i style="background:#ff9f5a"></i>100+ pkt/s</span>
+            <span>노드 크기 = 누적 패킷</span>
+            <span><i class="legend-packet req"></i> 요청 패킷</span>
+            <span><i class="legend-packet resp"></i> 응답·보고 패킷</span>
+            <span class="legend-hint">휠: 확대/축소 · 드래그: 이동 · 노드 드래그: 고정 · 노드 더블클릭: 고정 해제</span>
           </div>
         </div>
 
@@ -147,6 +177,34 @@
         </aside>
       </section>
 
+      <section class="alerts-panel vuln-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>취약점</h2>
+            <p id="vulndb-info">취약점 DB가 없습니다. 인터넷 PC에서 <code>python tools/vulndb_build.py --fetch</code>로 만든 vulndb.json을 업로드하세요.</p>
+          </div>
+          <div class="alert-filters">
+            <select id="vuln-level" aria-label="매칭 수준">
+              <option value="solid">확정·유력</option>
+              <option value="">전체(가능 포함)</option>
+              <option value="kev">KEV만</option>
+            </select>
+            <label class="button ghost" data-min-role="admin" title="tools/vulndb_build.py로 만든 vulndb.json">
+              <input id="vulndb-input" type="file" accept=".json" hidden>
+              취약점 DB 업로드
+            </label>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="alerts-table">
+            <thead>
+              <tr><th>위험</th><th>자산</th><th>권고문</th><th>대상 제품 / 영향 버전</th><th>CVSS</th><th>매칭</th><th>조치</th></tr>
+            </thead>
+            <tbody id="vulns-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="alerts-panel">
         <div class="panel-heading">
           <div>
@@ -158,6 +216,7 @@
               <option value="">전체 유형</option>
               <option value="policy">위험 명령</option>
               <option value="baseline">베이스라인 이탈</option>
+              <option value="anomaly">통계 이상</option>
             </select>
             <label class="toggle"><input id="show-acked" type="checkbox"> 확인된 경고 표시</label>
           </div>
@@ -172,11 +231,112 @@
         </div>
       </section>
 
+      <section class="alerts-panel admin-panel" data-min-role="admin">
+        <div class="panel-heading">
+          <div>
+            <h2>사용자 및 감사 로그</h2>
+            <p>조회자: 보기 전용 · 운영자: 경고 확인/정상 등록, PCAP 분석 · 관리자: 모드 변경, 취약점 DB, 사용자 관리</p>
+          </div>
+        </div>
+        <form id="user-form" class="user-form">
+          <input id="new-username" placeholder="사용자 이름" autocomplete="off" required>
+          <input id="new-user-password" type="password" placeholder="임시 비밀번호 (10자 이상)" autocomplete="new-password" minlength="10" required>
+          <select id="new-user-role" aria-label="역할">
+            <option value="viewer">조회자</option>
+            <option value="operator">운영자</option>
+            <option value="admin">관리자</option>
+          </select>
+          <button class="button" type="submit">사용자 추가</button>
+          <span id="user-form-status" class="import-status"></span>
+        </form>
+        <div class="table-wrap">
+          <table class="alerts-table">
+            <thead><tr><th>사용자</th><th>역할</th><th>상태</th><th>생성</th><th></th></tr></thead>
+            <tbody id="users-body"></tbody>
+          </table>
+        </div>
+        <div id="siem-status" class="siem-status"></div>
+        <div class="table-wrap audit-wrap">
+          <table class="alerts-table">
+            <thead><tr><th>시각</th><th>사용자</th><th>접속 IP</th><th>작업</th><th>결과</th></tr></thead>
+            <tbody id="audit-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <dialog id="password-dialog" class="password-dialog">
+        <form id="password-form" method="dialog">
+          <h2>비밀번호 변경</h2>
+          <label>현재 비밀번호 <input id="pw-current" type="password" autocomplete="current-password" required></label>
+          <label>새 비밀번호 (10자 이상) <input id="pw-new" type="password" autocomplete="new-password" minlength="10" required></label>
+          <label>새 비밀번호 확인 <input id="pw-confirm" type="password" autocomplete="new-password" minlength="10" required></label>
+          <p id="pw-error" class="form-error" hidden></p>
+          <div class="dialog-actions">
+            <button class="button ghost" type="button" id="pw-cancel">취소</button>
+            <button class="button" type="submit">변경</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog id="asset-dialog" class="password-dialog asset-dialog">
+        <form id="asset-form" method="dialog">
+          <h2>자산 정보 편집 <small id="asset-dialog-id" class="mono"></small></h2>
+          <p class="dialog-hint">입력한 값이 자동 식별 값보다 우선합니다. 비워 두면 자동 식별 값(회색 글씨)을 씁니다.
+            벤더·모델·펌웨어를 넣으면 취약점 대조에도 쓰입니다.</p>
+          <div class="asset-form-grid">
+            <label>표시 이름 <input name="name" maxlength="80" placeholder="예: 보일러 #2 제어 PLC"></label>
+            <label>장비 유형 <input name="device_type" maxlength="80" list="device-types"></label>
+            <label>벤더 <input name="vendor" maxlength="120"></label>
+            <label>모델 / 주문번호 <input name="model" maxlength="120"></label>
+            <label>펌웨어 <input name="firmware" maxlength="60"></label>
+            <label>운영체제 <input name="os" maxlength="120"></label>
+            <label>위치 (공정·라인·설치 장소) <input name="location" maxlength="120"></label>
+            <label>담당자 <input name="owner" maxlength="120"></label>
+            <label>중요도
+              <select name="criticality">
+                <option value="">미지정</option>
+                <option value="low">낮음</option>
+                <option value="medium">보통</option>
+                <option value="high">높음</option>
+                <option value="critical">심각 (핵심 설비)</option>
+              </select>
+            </label>
+          </div>
+          <label>메모 <textarea name="notes" maxlength="2000" rows="4" placeholder="점검 이력, 교체 계획, 접속 방법 등"></textarea></label>
+          <p class="dialog-meta" id="asset-dialog-meta"></p>
+          <p id="asset-error" class="form-error" hidden></p>
+          <div class="dialog-actions">
+            <button class="button ghost danger" type="button" id="asset-clear">입력값 모두 지우기</button>
+            <span class="spacer"></span>
+            <button class="button ghost" type="button" id="asset-cancel">취소</button>
+            <button class="button" type="submit">저장</button>
+          </div>
+        </form>
+      </dialog>
+      <datalist id="device-types">
+        <option value="PLC"></option>
+        <option value="HMI"></option>
+        <option value="Engineering workstation"></option>
+        <option value="SCADA server"></option>
+        <option value="Historian"></option>
+        <option value="RTU/IED"></option>
+        <option value="I/O adapter"></option>
+        <option value="AC Drive"></option>
+        <option value="Network switch"></option>
+        <option value="Router"></option>
+        <option value="Firewall"></option>
+        <option value="Server"></option>
+        <option value="IT workstation"></option>
+        <option value="Printer"></option>
+        <option value="IP camera"></option>
+      </datalist>
+
       <footer>
         <span>NetEye · 패킷 내용은 저장하지 않습니다.</span>
         <span id="capture-interface">센서 인터페이스 미설정</span>
       </footer>
     </main>
+    <script src="/assets/graph.js" defer></script>
     <script src="/assets/app.js" defer></script>
   </body>
 </html>
