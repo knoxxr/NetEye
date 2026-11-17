@@ -79,6 +79,14 @@ class NetGraph {
           packets: members.reduce((sum, a) => sum + (a.packets || 0), 0),
           protocols: [...protocols.entries()].sort((x, y) => y[1] - x[1]).map(([p]) => p),
           members: members.map((a) => a.label),
+          orgs: (() => {
+            const count = new Map();
+            members.forEach((a) => {
+              const name = (a.org && a.org.name) || (a.domains || []).slice(-1)[0] || "조직 미상";
+              count.set(name, (count.get(name) || 0) + 1);
+            });
+            return [...count.entries()].sort((x, y) => y[1] - x[1]);
+          })(),
         };
         members.forEach((a) => idMap.set(a.id, NetGraph.EXTERNAL));
         assets = [...assets.filter((a) => !idMap.has(a.id)), external];
@@ -110,7 +118,9 @@ class NetGraph {
       }
       node.asset = asset;
       // A computer name reads better than an address: show it first, the address underneath.
-      const named = (asset.manual && asset.manual.name) || asset.hostname;
+      const named = (asset.manual && asset.manual.name) || asset.hostname
+        || (asset.org && asset.org.well_known ? asset.org.name : (asset.domains || []).slice(-1)[0])
+        || (asset.org && asset.org.name);
       node.label = named || asset.label;
       node.sub = (() => {
         const identity = [asset.vendor, asset.model].filter(Boolean).join(" ");
@@ -596,8 +606,9 @@ class NetGraph {
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
     const rate = out + inn;
     if (node.id === NetGraph.EXTERNAL) {
-      const list = a.members.slice(0, 6).join(", ") + (a.members.length > 6 ? ` 외 ${a.members.length - 6}개` : "");
-      this.tooltip.innerHTML = `<strong>${esc(node.label)}</strong><span class="mono">${esc(list)}</span>
+      const list = a.orgs.slice(0, 8).map(([name, n]) => `${name} ${n}`).join(", ")
+        + (a.orgs.length > 8 ? ` 외 ${a.orgs.length - 8}곳` : "");
+      this.tooltip.innerHTML = `<strong>${esc(node.label)}</strong><span>${esc(list)}</span>
         <span>통신 ${peers}건${rate ? ` · 최근 ${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()} pkt/s` : ""}</span>
         <span>클릭하면 외부 주소를 하나씩 펼칩니다</span>`;
       this.tooltip.hidden = false;

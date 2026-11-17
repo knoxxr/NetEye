@@ -130,6 +130,16 @@ pub fn port_signature(is_tcp: bool, port: u16) -> Option<(&'static str, &'static
     })
 }
 
+/// Port-only signatures that fall in operating-system ephemeral ranges (Linux 32768+, Windows
+/// 49152+) also match the random source port of ordinary client traffic: a PC sending DNS or QUIC
+/// from port 61450 is not a CC-Link station. Such a match is ignored when the other side is a
+/// common internet or LAN service.
+pub fn ephemeral_clash(is_tcp: bool, port: u16, other: u16) -> bool {
+    let transport = if is_tcp { crate::decode::Transport::Tcp } else { crate::decode::Transport::Udp };
+    port >= 32768 && (crate::intel::internet_service(transport, other).is_some()
+        || matches!(other, 67 | 68 | 137 | 138 | 5353 | 5355))
+}
+
 pub fn port_only(sig: (&'static str, &'static str, f32), to_server: bool, out: &mut Vec<Finding>) {
     let (protocol, hint, confidence) = sig;
     out.push(Finding::new(protocol).op(protocol, MONITOR).req(Some(to_server)).hint(hint, confidence));

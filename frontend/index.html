@@ -205,6 +205,30 @@
         </div>
       </section>
 
+      <section class="alerts-panel external-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>외부 통신</h2>
+            <p id="external-info">인터넷 주소와의 통신을 상대 조직·도메인과 함께 보여 주고, 의심스러운 연결을 위로 올립니다.</p>
+          </div>
+          <div class="alert-filters">
+            <select id="external-filter" aria-label="외부 통신 필터">
+              <option value="flagged">주의 이상</option>
+              <option value="">전체</option>
+              <option value="unknown">잘 알려진 조직 제외</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="alerts-table external-table">
+            <thead>
+              <tr><th>판단</th><th>외부 주소</th><th>조직 · 도메인</th><th>내부 상대</th><th>서비스</th><th>패킷 (나감/들어옴)</th><th>최근</th></tr>
+            </thead>
+            <tbody id="external-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="alerts-panel">
         <div class="panel-heading">
           <div>
@@ -217,6 +241,7 @@
               <option value="policy">위험 명령</option>
               <option value="baseline">베이스라인 이탈</option>
               <option value="anomaly">통계 이상</option>
+              <option value="external">외부 통신</option>
             </select>
             <label class="toggle"><input id="show-acked" type="checkbox"> 확인된 경고 표시</label>
           </div>

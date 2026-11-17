@@ -61,8 +61,11 @@ pub fn dissect(frame: &Frame, out: &mut Vec<Finding>) {
         enip::dissect_io(out);
         return;
     }
-    for (port, to_server) in [(frame.dst_port, true), (frame.src_port, false)] {
+    for (port, other, to_server) in [(frame.dst_port, frame.src_port, true), (frame.src_port, frame.dst_port, false)] {
         if let Some(sig) = misc::port_signature(is_tcp, port) {
+            if misc::ephemeral_clash(is_tcp, port, other) {
+                continue;
+            }
             misc::port_only(sig, to_server, out);
             return;
         }

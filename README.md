@@ -128,6 +128,9 @@ neteye bench <pcap 파일 또는 폴더> --repeat 50       # 처리량 벤치마
 | `NETEYE_MAX_PCAP_MB` | 512 | 업로드 크기 제한 |
 | `NETEYE_LEARNING_HOURS` | 0 | 새 데이터베이스의 초기 학습 기간(시간). 0이면 대시보드에서 수동으로 탐지 모드로 전환 |
 | `NETEYE_VULNDB` | `data/vulndb.json` | 시작할 때 불러올 취약점 DB |
+| `NETEYE_IPASN` | `data/ip2asn-v4.tsv.gz` | 인터넷 주소의 소유 조직(AS)·국가 DB. `python tools/ipasn_build.py`로 생성 |
+| `NETEYE_BLOCKLIST` | `data/blocklist.txt` | 위협 인텔리전스 목록. `python tools/threatintel_build.py`로 생성 |
+| `NETEYE_INTERNAL_NETS` | (없음) | 공인 주소 대역을 내부망으로 쓰는 현장의 내부 대역, 쉼표로 구분 (예: `166.161.0.0/16`) |
 | `NETEYE_FRONTEND` | `frontend/` | 대시보드 파일 위치 |
 | `NETEYE_COOKIE_SECURE` | 0 | TLS 뒤에 둘 때 1로 설정 (세션 쿠키를 HTTPS로만 전송) |
 | `NETEYE_SYSLOG` | (없음) | SIEM 전송 대상, 쉼표로 구분: `udp://10.0.0.5:514,tcp://siem:601` (포트 생략 시 514) |
@@ -214,6 +217,40 @@ neteye bench <pcap 파일 또는 폴더> --repeat 50       # 처리량 벤치마
 API: `GET /api/baseline`, `POST /api/baseline/mode` (`{"mode": "learning"|"detecting", "hours": 24, "reset": false}`),
 `POST /api/alerts/{id}/learn`, `POST /api/alerts/{id}/ack`
 
+## 외부(인터넷) 통신 분석
+
+센서는 내부망과 인터넷 사이의 대화를 따로 추적합니다. 누가 연결을 열었는지(TCP SYN), 어떤 서비스 포트인지,
+방향(내부 → 인터넷 / 인터넷 → 내부)을 기록하고, 상대 주소가 누구인지와 의심 여부를 판단합니다. 외부 서비스에
+아무것도 물어보지 않으며 모든 판단은 센서 안의 자료로 합니다.
+
+**상대가 누구인지**
+
+- **소유 조직**: 오프라인 IP→AS DB(iptoasn.com, 퍼블릭 도메인)로 AS 번호·조직·국가를 찾습니다. Google, Microsoft,
+  AWS, Cloudflare, Akamai, Apple, NAVER, Kakao, KT, SK브로드밴드, LG U+ 등은 "잘 알려진 조직"으로 친숙한 이름을 붙입니다.
+- **접속에 쓰인 이름**: DNS 응답, TLS ClientHello의 SNI, HTTP Host 헤더에서 그 주소로 접속할 때 쓴 도메인을 모읍니다
+  (예: `chatgpt.com`). 자산 상세와 맵에 표시되고 검색됩니다.
+
+```powershell
+python tools/ipasn_build.py         # data/ip2asn-v4.tsv.gz (약 9MB, 46만 범위)
+python tools/threatintel_build.py   # data/blocklist.txt (abuse.ch Feodo Tracker C2 + Spamhaus DROP)
+```
+
+현장 고유의 지표는 `data/blocklist_custom.txt`에 한 줄에 하나(`주소[/접두사] # 메모`)로 적으면 다시 만들 때 합쳐집니다.
+
+**경고 (유형 "외부")**
+
+| 경고 | 조건 | 심각도 |
+|---|---|---|
+| 위협 인텔리전스 목록 주소와 통신 | 상대 주소가 위협 목록에 있음 | 심각 |
+| 산업 프로토콜의 인터넷 통신 | S7, Modbus, EtherNet/IP, DNP3, IEC 104, OPC UA, BACnet 등 산업 프로토콜 포트로 인터넷과 통신 | 심각 |
+| 인터넷에서 내부 서비스로 접속 | 인터넷에서 연 연결을 내부가 받아들임(TCP SYN-ACK, 서비스 포트의 UDP 응답) | 높음, RDP·SMB·VNC·Telnet이나 OT 장비면 심각 |
+| OT 장비의 인터넷 통신 | PLC·HMI·RTU 등 OT 장비(유형 또는 사용 프로토콜로 판단)가 인터넷으로 연결을 엶 | 높음 |
+
+**외부 통신 표**: 인터넷 주소마다 조직·도메인, 내부 상대, 서비스(포트·방향), 패킷 수를 보여 주고 판단 수준
+(위험 / 주의 / 참고 / 정상)과 사유를 붙여 의심스러운 순으로 정렬합니다. 사유에는 위 경고 조건 외에 "비표준 포트",
+"DNS·SNI 이름 없이 직접 접속"(연결 시작을 본 경우에만), "조직 정보 없음"이 있습니다. 양쪽 모두 임시 포트인 UDP
+(화상 통화, P2P)는 내부로의 접속으로 보지 않습니다.
+
 ## 데이터베이스 (BangDB)
 
 NetEye는 모든 데이터를 Go로 작성된 임베디드 SQL 데이터베이스 [BangDB](https://github.com/knoxxr/BangDB)
@@ -264,6 +301,7 @@ $env:NETEYE_SYSLOG_FORMAT = "cef"
 | `NE-ANOMALY-SILENCE`, `NE-ANOMALY-VOLUME`, `NE-ANOMALY-INTERVAL` | 통계적 이상 (통신 중단, 트래픽 급증, 폴링 주기 변화) | 위와 같음 |
 | `NE-PROCESS-RANGE`, `NE-PROCESS-STATE`, `NE-PROCESS-NEWPOINT` | 공정 값 이상 (범위 이탈, 새 상태값, 학습되지 않은 주소) | 위와 같음 |
 | `NE-MEASURE-RANGE`, `NE-MEASURE-STATE` | 측정값 이상 (범위 이탈, 미학습 상태값) | 위와 같음 |
+| `NE-EXT-THREAT`, `NE-EXT-ICS`, `NE-EXT-INBOUND`, `NE-EXT-OT` | 외부 통신 (위협 목록, 산업 프로토콜 인터넷 노출, 인터넷에서의 접속, OT 장비의 인터넷 통신) | 위와 같음 |
 | `NE-AUDIT-LOGIN`, `-LOGIN-FAILED`, `-LOCKOUT`, `-DENIED`, `-CHANGE` | 로그인, 계정 잠금, 권한 부족으로 거부된 요청, 설정 변경 | 1 / 5 / 8 / 5 / 3 |
 
 - 경고는 처음 발생할 때 한 번 보내고, 확인 처리한 뒤 다시 발생하면 한 번 더 보냅니다(`cs4=reopened`). 반복
@@ -425,7 +463,7 @@ REST/WebSocket API와 대시보드는 이전과 같습니다. Python 버전을 �
 ## 검증
 
 ```powershell
-cd sensor; cargo test --release                       # 테스트 70개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
+cd sensor; cargo test --release                       # 테스트 79개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
                                                       # (저장 테스트는 실제 인메모리 bangdb를 띄우므로 먼저 빌드 필요)
 python tools/differential.py <pcap 폴더> --vulndb vulndb.json   # Rust와 기준 엔진을 필드 단위로 비교
 ```
@@ -437,6 +475,8 @@ python tools/differential.py <pcap 폴더> --vulndb vulndb.json   # Rust와 기�
 
 ## 알려진 제약
 
+- 외부 통신 추적은 메모리에만 있어 센서를 다시 시작하면 새로 쌓입니다(경고와 자산의 도메인 이름은 저장됨).
+  암호화된 DNS(DoH)나 TLS ECH를 쓰면 접속 이름을 알 수 없습니다. 조직 DB와 위협 목록은 도구로 새로 받아야 갱신됩니다.
 - 공정 포인트는 최대 10만 개까지 학습합니다. 가득 차면 새 주소는 저장하지 않지만 그 주소로의 쓰기는 계속 경고하고,
   "공정 포인트 추적 한도 도달" 경고를 냅니다. 학습되지 않은 주소 쓰기는 같은 출발지·목적지 쌍마다 10분에 20건까지 개별
   경고, 이후는 요약 경고(심각도 높음) 하나에 주소 목록(최대 200개, 나머지는 개수)과 횟수로 모입니다.

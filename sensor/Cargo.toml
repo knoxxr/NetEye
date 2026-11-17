@@ -7,6 +7,7 @@ edition = "2024"
 argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["ws"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+flate2 = "1.1.11"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
 libloading = "0.9.1"

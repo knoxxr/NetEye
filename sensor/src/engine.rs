@@ -7,6 +7,7 @@
 use crate::baseline::{self, Baseline, Item, Mode};
 use crate::profile::{Anomaly, LinkProfile, PointAnomaly, PointProfile};
 use crate::decode::{self, Frame, Transport};
+use crate::intel;
 use crate::osfp;
 use crate::dissect::{self, base::{category_label, Finding, PointId, PointValue, ReadItem, CONTROL, PROGRAM}};
 use crate::vulns::{risk_level, VulnDb, VulnMatch, CONFIRMED, LIKELY, POSSIBLE};
@@ -105,6 +106,8 @@ pub struct Asset {
     pub os_confidence: f64,
     pub os_evidence: String,
     pub manual: ManualInfo,
+    /// Names other hosts used to reach this address (DNS answers, TLS SNI, HTTP Host).
+    pub domains: Vec<String>,
     dirty: bool,
 }
 
@@ -235,6 +238,8 @@ pub struct Alert {
     pub acknowledged: bool,
     /// Raised by the statistical profile (volume, timing, silence) rather than policy or baseline.
     pub anomaly: bool,
+    /// Raised by the internet-connection rules (threat lists, exposure, OT devices online).
+    pub external: bool,
     pub baseline: Option<Item>,
     pub details: Vec<(String, Value)>,
     dirty: bool,
@@ -334,6 +339,14 @@ pub struct Engine {
     mac_ips: FxHashMap<u64, Vec<u32>>,
     /// DHCP names/OS for clients not yet seen with an address, applied when their MAC shows up.
     pending_hosts: FxHashMap<u64, osfp::HostInfo>,
+    /// Address intelligence (optional data files) and the conversations crossing the internet edge.
+    asn_db: Option<Arc<intel::AsnDb>>,
+    blocklist: Option<Arc<intel::Blocklist>>,
+    internal_nets: Vec<(u32, u32)>,
+    external: FxHashMap<ExtKey, ExtConn>,
+    /// Names learned for addresses that have no asset yet.
+    pending_names: FxHashMap<u32, Vec<String>>,
+    next_external_sweep: i64,
     /// New-point alerts per (client, server): (count in window, window start, individual alerts ever).
     new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64, u32)>,
     conversations: FxHashMap<(AssetKey, AssetKey, &'static str), Sym>,
@@ -392,6 +405,12 @@ impl Engine {
             alerts: Default::default(),
             mac_ips: Default::default(),
             pending_hosts: Default::default(),
+            asn_db: None,
+            blocklist: None,
+            internal_nets: Vec::new(),
+            external: Default::default(),
+            pending_names: Default::default(),
+            next_external_sweep: 0,
             new_point_alerts: Default::default(),
             conversations: Default::default(),
             next_alert_id: 1,
@@ -444,6 +463,10 @@ impl Engine {
         self.observe(frame, findings);
         if frame.ts_ms > self.clock {
             self.clock = frame.ts_ms;
+        }
+        if self.clock >= self.next_external_sweep {
+            self.next_external_sweep = self.clock + 60_000;
+            self.sweep_external(self.clock);
         }
         if self.clock >= self.next_silence_check {
             self.next_silence_check = self.clock + 10_000;
@@ -706,6 +729,12 @@ impl Engine {
         if let Some(info) = host.filter(|i| i.client.is_none()) {
             self.apply_host(src, &info);
         }
+        if frame.src_ip.is_some() && matches!(frame.transport, Transport::Tcp | Transport::Udp) {
+            for (ip, name, _) in intel::names(frame) {
+                self.add_domain(ip, name);
+            }
+            self.observe_external(frame, now);
+        }
         if let Some(d) = dst {
             self.touch(d, frame.size, now, None);
         }
@@ -882,6 +911,285 @@ impl Engine {
     }
 
     // -------------------------------------------------------------- assets
+    // ------------------------------------------------------ internet edge
+    pub fn set_intel(&mut self, asn: Option<Arc<intel::AsnDb>>, blocklist: Option<Arc<intel::Blocklist>>) {
+        self.asn_db = asn;
+        self.blocklist = blocklist;
+        self.generation += 1;
+    }
+
+    /// Networks to treat as internal even though their addresses are public (plants that number
+    /// their networks out of public space).
+    pub fn set_internal_nets(&mut self, nets: &[String]) -> Result<(), String> {
+        let mut out = Vec::new();
+        for net in nets {
+            let (addr, prefix) = net.split_once('/').unwrap_or((net, "32"));
+            let ip = addr.trim().parse::<std::net::Ipv4Addr>().map_err(|_| format!("NETEYE_INTERNAL_NETS: {net}"))?;
+            let prefix: u32 = prefix.trim().parse().ok().filter(|p| *p <= 32).ok_or(format!("NETEYE_INTERNAL_NETS: {net}"))?;
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            out.push((u32::from(ip) & mask, mask));
+        }
+        self.internal_nets = out;
+        Ok(())
+    }
+
+    /// An address on the internet: routable, not private, not one of the site's own networks.
+    pub fn is_internet(&self, ip: u32) -> bool {
+        decode::is_unicast_ip(ip) && !decode::is_private_ip(ip)
+            && !self.internal_nets.iter().any(|(net, mask)| ip & mask == *net)
+    }
+
+    fn add_domain(&mut self, ip: u32, name: String) {
+        if !self.is_internet(ip) {
+            return;
+        }
+        match self.assets.get_mut(&AssetKey::Ip(ip)) {
+            Some(a) => {
+                if !a.domains.contains(&name) {
+                    if a.domains.len() >= MAX_DOMAINS {
+                        a.domains.remove(0);
+                    }
+                    a.domains.push(name);
+                    self.mark_asset(AssetKey::Ip(ip));
+                }
+            }
+            None => {
+                if self.pending_names.len() >= 50_000 {
+                    self.pending_names.clear();
+                }
+                let names = self.pending_names.entry(ip).or_default();
+                if !names.contains(&name) && names.len() < MAX_DOMAINS {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
+    /// Whether an internal asset is part of the control system (by type or by the protocols it uses).
+    fn is_ot_asset(&self, ip: u32) -> bool {
+        let Some(a) = self.assets.get(&AssetKey::Ip(ip)) else { return false };
+        let kind = pick(&a.manual.device_type, self.syms.get(a.device_type)).to_ascii_lowercase();
+        if ["it workstation", "printer", "server", "router", "firewall", "switch", "camera"].iter().any(|k| kind.contains(k)) {
+            return false;
+        }
+        const OT_TYPES: [&str; 14] = ["plc", "rtu", "ied", "hmi", "scada", "engineering", "i/o", "drive",
+                                      "industrial", "historian", "merging", "building", "controller", "adapter"];
+        const OT_PROTOCOLS: [&str; 18] = ["s7", "modbus", "ethernet/ip", "cip", "dnp3", "60870", "61850", "mms",
+                                          "goose", "profinet", "cc-link", "ethercat", "powerlink", "bacnet", "opc",
+                                          "fins", "melsec", "iso-tsap"];
+        OT_TYPES.iter().any(|t| kind.contains(t))
+            || a.protocols.iter().any(|p| {
+                let p = self.syms.get(*p).to_ascii_lowercase();
+                OT_PROTOCOLS.iter().any(|o| p.contains(o))
+            })
+    }
+
+    /// Conversations between the site and the internet: who opened them, on which service, and
+    /// whether they break a rule (threat list, industrial protocol, OT device, inbound access).
+    fn observe_external(&mut self, frame: &Frame, now: i64) {
+        let (Some(s), Some(d)) = (frame.src_ip, frame.dst_ip) else { return };
+        let (s_net, d_net) = (self.is_internet(s), self.is_internet(d));
+        if s_net == d_net || !decode::is_unicast_ip(if s_net { d } else { s }) {
+            return; // purely internal, purely external, or broadcast/multicast
+        }
+        let (internal, outside) = if s_net { (d, s) } else { (s, d) };
+        let (mut port, client_is_src) = intel::service_side(frame.transport, frame.src_port, frame.dst_port, frame.tcp_flags);
+        let mut inbound = (if client_is_src { s } else { d }) == outside;
+        let (internal_port, outside_port) = if s == internal { (frame.src_port, frame.dst_port) } else { (frame.dst_port, frame.src_port) };
+        // UDP between two temporary ports (voice/video calls, games, P2P after NAT traversal) has no
+        // server side: it is recorded as the site talking to that peer, never as inbound access.
+        if frame.transport == Transport::Udp && internal_port >= 1024 && outside_port >= 1024
+            && !intel::known_port(frame.transport, internal_port) && !intel::known_port(frame.transport, outside_port) {
+            (port, inbound) = (outside_port, false);
+        }
+        let key = ExtKey { internal, external: outside, tcp: frame.transport == Transport::Tcp, port, inbound };
+        let from_inside = s == internal;
+        let is_new = !self.external.contains_key(&key);
+        if is_new {
+            if self.external.len() >= MAX_EXTERNAL {
+                self.external.retain(|_, c| now - c.last_seen < 3_600_000);
+            }
+            self.external_rules_new(&key, now);
+            if self.external.len() >= MAX_EXTERNAL {
+                return; // rules were still applied; the conversation just is not kept
+            }
+        }
+        let conn = self.external.entry(key).or_insert_with(|| ExtConn { first_seen: now, ..Default::default() });
+        conn.last_seen = now;
+        if frame.transport == Transport::Tcp && frame.tcp_flags & 0x12 == 0x02 {
+            conn.opened = true;
+        }
+        if from_inside {
+            conn.packets_out += 1;
+            conn.bytes_out += frame.size as u64;
+        } else {
+            conn.packets_in += 1;
+            conn.bytes_in += frame.size as u64;
+        }
+        // An inbound conversation the internal host answers was accepted: a TCP SYN-ACK, or a UDP
+        // reply from a service port.
+        let answered = match frame.transport {
+            Transport::Tcp => frame.tcp_flags & 0x12 == 0x12,
+            _ => true,
+        };
+        if inbound && from_inside && answered && !conn.accepted {
+            conn.accepted = true;
+            self.external_inbound_accepted(&key, now);
+        }
+    }
+
+    fn external_alert(&mut self, severity: &'static str, title: &str, key: &ExtKey, details: Vec<(String, Value)>, now: i64) {
+        let (src, dst) = if key.inbound { (AssetKey::Ip(key.external), AssetKey::Ip(key.internal)) }
+                         else { (AssetKey::Ip(key.internal), AssetKey::Ip(key.external)) };
+        let transport = if key.tcp { Transport::Tcp } else { Transport::Udp };
+        let service = intel::industrial_service(transport, key.port).or_else(|| intel::internet_service(transport, key.port));
+        let proto = self.sym_fmt(format_args!("{}/{}", if key.tcp { "TCP" } else { "UDP" }, key.port));
+        let title = self.syms.intern(title);
+        let op = self.syms.intern("External connection");
+        let mut details = details;
+        details.push(("port".into(), Value::from(format!("{}/{}", key.port, if key.tcp { "TCP" } else { "UDP" }))));
+        if let Some(service) = service {
+            details.push(("service".into(), Value::from(service)));
+        }
+        details.push(("direction".into(), Value::from(if key.inbound { "인터넷 → 내부" } else { "내부 → 인터넷" })));
+        if let Some(org) = self.org_of(key.external) {
+            details.push(("organization".into(), Value::from(org.name)));
+        }
+        self.alert(severity, title, proto, op, src, Some(dst), now, "", details, None);
+        if let Some(alert) = self.alerts.get_mut(&AlertKey { title, src, dst: Some(dst) }) {
+            alert.external = true;
+        }
+    }
+
+    fn external_rules_new(&mut self, key: &ExtKey, now: i64) {
+        let transport = if key.tcp { Transport::Tcp } else { Transport::Udp };
+        if let Some(list) = self.blocklist.as_ref().and_then(|b| b.lookup(key.external)).map(str::to_string) {
+            self.external_alert("critical", "위협 인텔리전스 목록 주소와 통신", key,
+                                vec![("threat_list".into(), Value::from(list))], now);
+        }
+        if let Some(protocol) = intel::industrial_service(transport, key.port) {
+            self.external_alert("critical", "산업 프로토콜의 인터넷 통신", key,
+                                vec![("protocol".into(), Value::from(protocol))], now);
+        }
+        if !key.inbound && self.is_ot_asset(key.internal) {
+            self.external_alert("high", "OT 장비의 인터넷 통신", key, Vec::new(), now);
+        }
+    }
+
+    fn external_inbound_accepted(&mut self, key: &ExtKey, now: i64) {
+        let transport = if key.tcp { Transport::Tcp } else { Transport::Udp };
+        let severity = if intel::risky_service(transport, key.port) || self.is_ot_asset(key.internal) { "critical" } else { "high" };
+        self.external_alert(severity, "인터넷에서 내부 서비스로 접속", key, Vec::new(), now);
+    }
+
+    /// Devices identified as OT only after their first internet conversation are caught here.
+    fn sweep_external(&mut self, now: i64) {
+        let pending: Vec<ExtKey> = self.external.iter()
+            .filter(|(k, c)| !k.inbound && !c.ot_checked && now - c.last_seen < 3_600_000)
+            .map(|(k, _)| *k).collect();
+        for key in pending {
+            if self.is_ot_asset(key.internal) {
+                self.external_alert("high", "OT 장비의 인터넷 통신", &key, Vec::new(), now);
+                if let Some(c) = self.external.get_mut(&key) {
+                    c.ot_checked = true;
+                }
+            }
+        }
+    }
+
+    fn org_of(&self, ip: u32) -> Option<OrgView> {
+        let db = self.asn_db.as_ref()?;
+        let info = db.lookup(ip)?;
+        Some(OrgView {
+            asn: info.asn, country: info.country.to_string(), holder: info.holder.to_string(),
+            name: intel::org_label(info.asn, info.holder), well_known: intel::well_known(info.asn).is_some(),
+        })
+    }
+
+    /// One row per internet address: who owns it, what the site does with it, and why it may matter.
+    fn external_views(&self, now: i64) -> Vec<ExternalView> {
+        let mut by_ip: FxHashMap<u32, Vec<(&ExtKey, &ExtConn)>> = FxHashMap::default();
+        for (k, c) in &self.external {
+            by_ip.entry(k.external).or_default().push((k, c));
+        }
+        let mut views: Vec<ExternalView> = by_ip.into_iter().map(|(ip, conns)| {
+            let org = self.org_of(ip);
+            let asset = self.assets.get(&AssetKey::Ip(ip));
+            let domains = asset.map(|a| a.domains.clone()).unwrap_or_default();
+            let threat = self.blocklist.as_ref().and_then(|b| b.lookup(ip)).map(str::to_string);
+            let mut peers: Vec<u32> = conns.iter().map(|(k, _)| k.internal).collect();
+            peers.sort_unstable();
+            peers.dedup();
+            let mut reasons: Vec<(u32, String)> = Vec::new();
+            if let Some(list) = &threat {
+                reasons.push((100, format!("위협 인텔리전스 목록 ({list})")));
+            }
+            let mut services: Vec<ServiceView> = Vec::new();
+            let (mut pout, mut pin, mut bout, mut bin, mut first, mut last) = (0, 0, 0, 0, i64::MAX, 0);
+            for (k, c) in &conns {
+                let transport = if k.tcp { Transport::Tcp } else { Transport::Udp };
+                let ics = intel::industrial_service(transport, k.port);
+                let name = ics.or_else(|| intel::internet_service(transport, k.port));
+                if let Some(p) = ics {
+                    reasons.push((90, format!("산업 프로토콜 {p} ({}/{})", k.port, if k.tcp { "TCP" } else { "UDP" })));
+                }
+                if k.inbound && c.accepted {
+                    reasons.push((if intel::risky_service(transport, k.port) { 85 } else { 70 },
+                                  format!("인터넷에서 내부로 접속 허용 (포트 {})", k.port)));
+                } else if k.inbound {
+                    reasons.push((20, format!("인터넷에서 접속 시도 (포트 {})", k.port)));
+                } else if name.is_none() {
+                    reasons.push((15, format!("비표준 포트 {}/{}", k.port, if k.tcp { "TCP" } else { "UDP" })));
+                }
+                if !k.inbound && self.is_ot_asset(k.internal) {
+                    reasons.push((80, format!("OT 장비와 통신 ({})", decode::ip_string(k.internal))));
+                }
+                if services.len() < 12 && !services.iter().any(|s| s.port == k.port && s.tcp == k.tcp && s.inbound == k.inbound) {
+                    services.push(ServiceView { port: k.port, tcp: k.tcp, inbound: k.inbound, accepted: c.accepted,
+                                                name: name.unwrap_or("") });
+                }
+                pout += c.packets_out;
+                pin += c.packets_in;
+                bout += c.bytes_out;
+                bin += c.bytes_in;
+                first = first.min(c.first_seen);
+                last = last.max(c.last_seen);
+            }
+            let well_known = org.as_ref().is_some_and(|o| o.well_known);
+            // Judged only for conversations seen from their start: a session opened before capture
+            // began may well have used a name the sensor never saw.
+            if domains.is_empty() && !well_known && conns.iter().any(|(k, c)| !k.inbound && c.opened) {
+                reasons.push((15, "DNS·SNI 이름 없이 직접 접속".into()));
+            }
+            if self.asn_db.is_some() && org.is_none() {
+                reasons.push((10, "조직 정보 없음".into()));
+            }
+            reasons.sort_by_key(|r| std::cmp::Reverse(r.0));
+            reasons.dedup_by(|a, b| a.1 == b.1);
+            // The strongest reason sets the level; weaker ones add a little.
+            let score = reasons.first().map(|r| r.0).unwrap_or(0)
+                + reasons.iter().skip(1).map(|r| r.0 / 3).sum::<u32>();
+            ExternalView {
+                id: AssetKey::Ip(ip).to_string(), ip: decode::ip_string(ip), org, domains, threat,
+                peer_count: peers.len(), peers: peers.iter().take(8).map(|p| decode::ip_string(*p)).collect(),
+                services, packets_out: pout, packets_in: pin, bytes_out: bout, bytes_in: bin,
+                first_seen: iso(first), last_seen: iso(last), online: now - last <= ONLINE_WINDOW_MS,
+                score: score.min(100), reasons: reasons.into_iter().map(|r| r.1).collect(),
+            }
+        }).collect();
+        views.sort_by(|a, b| b.score.cmp(&a.score).then((b.packets_out + b.packets_in).cmp(&(a.packets_out + a.packets_in))));
+        views.truncate(500);
+        views
+    }
+
+    fn intel_status(&self) -> Value {
+        json!({
+            "asn": self.asn_db.as_ref().map(|db| json!({"ranges": db.len(), "source": db.source})),
+            "blocklist": self.blocklist.as_ref().map(|b| json!({"entries": b.len(), "sources": b.sources(), "path": b.path})),
+            "internal_nets": self.internal_nets.len(),
+        })
+    }
+
     /// Keep the better-supported OS guess and computer name.
     fn apply_host(&mut self, key: AssetKey, info: &osfp::HostInfo) {
         let Some(a) = self.assets.get_mut(&key) else { return };
@@ -955,6 +1263,10 @@ impl Engine {
             os_confidence: 0.0,
             os_evidence: String::new(),
             manual: ManualInfo::default(),
+            domains: match key {
+                AssetKey::Ip(ip) => self.pending_names.remove(&ip).unwrap_or_default(),
+                AssetKey::Mac(_) => Vec::new(),
+            },
             dirty: false,
         };
         self.assets.insert(key, asset);
@@ -1258,7 +1570,7 @@ impl Engine {
             let id = *next_id;
             *next_id += 1;
             Alert { id, key, severity, protocol, operation, category, src, dst, count: 0, first_seen: now,
-                    last_seen: now, acknowledged: false, anomaly: false, baseline, details, dirty: false }
+                    last_seen: now, acknowledged: false, anomaly: false, external: false, baseline, details, dirty: false }
         });
         let created = alert.count == 0;
         alert.count += 1;
@@ -1494,6 +1806,8 @@ impl Engine {
             hostname: &a.hostname, hostname_confidence: a.hostname_confidence,
             os: if live { pick(&m.os, &a.os) } else { &a.os }, os_confidence: a.os_confidence, os_evidence: &a.os_evidence,
             manual: a.manual.has_values().then_some(&a.manual),
+            domains: &a.domains,
+            org: if live { a.ip.filter(|ip| self.is_internet(*ip)).and_then(|ip| self.org_of(ip)) } else { None },
             auto: (live && a.manual.has_values()).then(|| AutoView {
                 device_type: self.syms.get(a.device_type), vendor: &a.identity[0], model: &a.identity[1],
                 firmware: &a.identity[2], os: &a.os,
@@ -1521,7 +1835,8 @@ impl Engine {
             category_label: category_label(a.category), src: a.src.to_string(), dst: a.dst.map(|d| d.to_string()),
             count: a.count, first_seen: iso(a.first_seen), last_seen: iso(a.last_seen),
             status: if a.acknowledged { "acknowledged" } else { "new" },
-            source: if a.baseline.is_some() { "baseline" } else if a.anomaly { "anomaly" } else { "policy" },
+            source: if a.baseline.is_some() { "baseline" } else if a.anomaly { "anomaly" }
+                    else if a.external { "external" } else { "policy" },
             baseline: a.baseline.map(|item| BaselineRef { kind: item.kind(), key: self.item_key(&item) }),
             details: a.details.iter().map(|(k, v)| (k.as_str(), v)).collect(),
         }
@@ -1572,6 +1887,7 @@ impl Engine {
             "vulnerable_assets": assets.iter().filter(|a| a.vulns.iter().any(|v| v.level != POSSIBLE)).count(),
             "kev_assets": assets.iter().filter(|a| a.vulns.iter().any(|v| v.kev && v.level != POSSIBLE)).count(),
         });
+        let external = self.external_views(now_ms);
         let alert_views: Vec<AlertView> = alerts.iter().take(500).map(|a| self.alert_view(a)).collect();
         let snapshot = Snapshot {
             assets: asset_views,
@@ -1580,6 +1896,8 @@ impl Engine {
             baseline: self.baseline.status_json(),
             vulndb: self.vulndb.as_ref().map(|db| db.info()),
             stats,
+            external,
+            intel: self.intel_status(),
         };
         serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into())
     }
@@ -1726,6 +2044,7 @@ impl Engine {
                     else { doc.get("hostname_confidence").and_then(|x| x.as_f64()).unwrap_or(0.0) },
                 hostname, os, os_confidence, os_evidence,
                 manual: doc.get("manual").cloned().and_then(|m| serde_json::from_value(m).ok()).unwrap_or_default(),
+                domains: strs(&doc, "domains").into_iter().take(MAX_DOMAINS).collect(),
                 vulns: doc.get("vulns").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
                 risk: doc.get("risk").and_then(|x| x.as_f64()).unwrap_or(0.0),
                 risk_level: static_str(&s(&doc, "risk_level"), &["critical", "high", "medium", "low", "none"]),
@@ -1786,6 +2105,7 @@ impl Engine {
                 last_seen: parse_iso(&s(&doc, "last_seen")).unwrap_or(0),
                 acknowledged: s(&doc, "status") == "acknowledged",
                 anomaly: s(&doc, "source") == "anomaly",
+                external: s(&doc, "source") == "external",
                 baseline,
                 details: doc.get("details").and_then(|d| d.as_object())
                     .map(|d| d.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
@@ -1794,7 +2114,74 @@ impl Engine {
             self.alerts.insert(key, alert);
         }
         self.learning = self.baseline.mode == Mode::Learning;
+        self.forget_ephemeral_misidentification();
+        self.acknowledge_p2p_inbound_alerts();
         self.generation += 1;
+    }
+
+    /// An early build reported UDP between two temporary ports (calls, P2P) as inbound access.
+    fn acknowledge_p2p_inbound_alerts(&mut self) {
+        let title = self.syms.intern("인터넷에서 내부 서비스로 접속");
+        let stale: Vec<AlertKey> = self.alerts.iter().filter(|(k, a)| {
+            k.title == title && !a.acknowledged && a.details.iter().any(|(name, v)| {
+                name == "port" && v.as_str().and_then(|p| p.strip_suffix("/UDP")).and_then(|n| n.parse::<u16>().ok())
+                    .is_some_and(|n| n >= 1024 && !intel::known_port(Transport::Udp, n))
+            })
+        }).map(|(k, _)| *k).collect();
+        for key in stale {
+            if let Some(alert) = self.alerts.get_mut(&key) {
+                alert.acknowledged = true;
+            }
+            self.mark_alert(key);
+        }
+    }
+
+    /// Earlier versions took a client's random source port (UDP 61450/61451, 34964) for CC-Link IE
+    /// Field Basic or PROFINET CM. Hosts whose only industrial trait is such a port-only match are
+    /// returned to "Unknown", and the internet alerts that rested on it are dropped.
+    fn forget_ephemeral_misidentification(&mut self) {
+        let suspect = ["CC-Link IE Field Basic", "PROFINET CM"];
+        let suspect_syms: Vec<Sym> = suspect.iter().map(|p| self.syms.intern(p)).collect();
+        let hints = ["CC-Link IE Field Basic station", "PROFINET device"];
+        // A real fieldbus station does not browse the internet; a misread PC does.
+        let online: FxHashSet<AssetKey> = self.links.keys().flat_map(|l| {
+            let public = |k: AssetKey| matches!(k, AssetKey::Ip(ip) if self.is_internet(ip));
+            [(public(l.server), l.client), (public(l.client), l.server)]
+        }).filter(|(other_public, _)| *other_public).map(|(_, k)| k).collect();
+        let mut fixed = Vec::new();
+        for (key, a) in self.assets.iter_mut() {
+            if !hints.contains(&self.syms.get(a.device_type)) || !online.contains(key) {
+                continue;
+            }
+            let other_ot = a.protocols.iter().any(|p| {
+                let name = self.syms.get(*p);
+                !suspect_syms.contains(p) && !matches!(name, "ARP" | "TCP" | "UDP" | "ICMP" | "IPv6")
+                    && !name.starts_with("IP/") && !name.starts_with("L2 ") && !name.starts_with("802.")
+            });
+            if other_ot {
+                continue;
+            }
+            a.device_type = self.sym_unknown;
+            a.confidence = 0.0;
+            a.protocols.retain(|p| !suspect_syms.contains(p));
+            a.evidence.retain(|e| !suspect.iter().any(|s| self.syms.get(*e).contains(s)));
+            a.dirty = true;
+            fixed.push(*key);
+        }
+        if fixed.is_empty() {
+            return;
+        }
+        self.dirty_assets.extend(fixed.iter().copied());
+        let ot_title = self.syms.intern("OT 장비의 인터넷 통신");
+        let stale: Vec<AlertKey> = self.alerts.keys()
+            .filter(|k| k.title == ot_title && fixed.contains(&k.src)).copied().collect();
+        for key in stale {
+            // Acknowledged rather than deleted: the history stays, the open list is corrected.
+            if let Some(alert) = self.alerts.get_mut(&key) {
+                alert.acknowledged = true;
+            }
+            self.mark_alert(key);
+        }
     }
 
     // ----------------------------------------------------------------- SIEM
@@ -1824,6 +2211,10 @@ impl Engine {
                 (None, "Firmware change") => "NE-FIRMWARE-CHANGE".to_string(),
                 (None, "Vulnerability") if title.contains("KEV") => "NE-VULN-KEV".to_string(),
                 (None, "Vulnerability") => "NE-VULN-CRITICAL".to_string(),
+                (None, _) if a.external && title.starts_with("위협 인텔리전스") => "NE-EXT-THREAT".to_string(),
+                (None, _) if a.external && title.starts_with("산업 프로토콜") => "NE-EXT-ICS".to_string(),
+                (None, _) if a.external && title.starts_with("OT 장비") => "NE-EXT-OT".to_string(),
+                (None, _) if a.external => "NE-EXT-INBOUND".to_string(),
                 (None, _) if a.anomaly && title.starts_with("측정값 범위") => "NE-MEASURE-RANGE".to_string(),
                 (None, _) if a.anomaly && title.starts_with("측정 상태") => "NE-MEASURE-STATE".to_string(),
                 (None, _) if a.anomaly && title.starts_with("공정 값 범위") => "NE-PROCESS-RANGE".to_string(),
@@ -1850,7 +2241,8 @@ impl Engine {
                 alert_id: Some(a.id),
                 count: Some(a.count),
                 reopened,
-                source: if a.baseline.is_some() { "baseline" } else if a.anomaly { "anomaly" } else { "policy" }.to_string(),
+                source: if a.baseline.is_some() { "baseline" } else if a.anomaly { "anomaly" }
+                        else if a.external { "external" } else { "policy" }.to_string(),
                 protocol: self.syms.get(a.protocol).to_string(),
                 operation: operation.to_string(),
                 category: a.category.to_string(),
@@ -1904,6 +2296,73 @@ impl Engine {
 }
 
 // ------------------------------------------------------------------ views
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ExtKey {
+    internal: u32,
+    external: u32,
+    tcp: bool,
+    /// The service port (the side that accepts the conversation).
+    port: u16,
+    /// Opened from the internet.
+    inbound: bool,
+}
+
+#[derive(Default)]
+struct ExtConn {
+    packets_out: u64,
+    packets_in: u64,
+    bytes_out: u64,
+    bytes_in: u64,
+    first_seen: i64,
+    last_seen: i64,
+    accepted: bool,
+    ot_checked: bool,
+    /// The opening of the conversation was seen (TCP SYN), so a missing name means none was used.
+    opened: bool,
+}
+
+const MAX_EXTERNAL: usize = 100_000;
+const MAX_DOMAINS: usize = 8;
+
+#[derive(Serialize)]
+struct OrgView {
+    asn: u32,
+    name: String,
+    holder: String,
+    country: String,
+    well_known: bool,
+}
+
+#[derive(Serialize)]
+struct ServiceView {
+    port: u16,
+    tcp: bool,
+    inbound: bool,
+    accepted: bool,
+    name: &'static str,
+}
+
+#[derive(Serialize)]
+struct ExternalView {
+    id: String,
+    ip: String,
+    org: Option<OrgView>,
+    domains: Vec<String>,
+    threat: Option<String>,
+    peers: Vec<String>,
+    peer_count: usize,
+    services: Vec<ServiceView>,
+    packets_out: u64,
+    packets_in: u64,
+    bytes_out: u64,
+    bytes_in: u64,
+    first_seen: String,
+    last_seen: String,
+    online: bool,
+    score: u32,
+    reasons: Vec<String>,
+}
+
 /// Automatically identified values, shown next to what an operator entered.
 #[derive(Serialize)]
 struct AutoView<'a> {
@@ -1958,6 +2417,10 @@ struct AssetView<'a> {
     os_evidence: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     manual: Option<&'a ManualInfo>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    domains: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org: Option<OrgView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto: Option<AutoView<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2037,6 +2500,8 @@ struct Snapshot<'a> {
     baseline: Value,
     vulndb: Option<Value>,
     stats: Value,
+    external: Vec<ExternalView>,
+    intel: Value,
 }
 
 fn ordered_map<S: serde::Serializer, K: Serialize, V: Serialize>(items: &[(K, V)], s: S) -> Result<S::Ok, S::Error> {
