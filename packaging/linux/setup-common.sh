@@ -1,6 +1,13 @@
 # Shared by install.sh and the .deb maintainer scripts (sourced, POSIX sh).
 # Creates the service account, data folder and settings, and starts the service.
 
+neteye_as_service() {  # run a command as the neteye account
+    if command -v runuser >/dev/null; then runuser -u neteye -- "$@"
+    elif command -v setpriv >/dev/null; then setpriv --reuid=neteye --regid=neteye --init-groups "$@"
+    else su -s /bin/sh neteye -c "$*"
+    fi
+}
+
 neteye_prepare() {
     if ! getent group neteye >/dev/null; then
         groupadd --system neteye
@@ -15,9 +22,10 @@ neteye_prepare() {
         install -m 0660 -o root -g neteye /usr/share/neteye/neteye.conf /etc/neteye/neteye.conf
     fi
     # Offline data shipped with the package; never replaces newer files (updated by update-intel).
+    # Written as the service account: root never writes into the folder neteye controls.
     for f in vulndb.json ip2asn-v4.tsv.gz; do
-        if [ ! -f "/var/lib/neteye/$f" ] && [ -f "/usr/share/neteye/data/$f" ]; then
-            install -m 0640 -o neteye -g neteye "/usr/share/neteye/data/$f" "/var/lib/neteye/$f"
+        if [ -f "/usr/share/neteye/data/$f" ]; then
+            neteye_as_service sh -c "[ -e '/var/lib/neteye/$f' ] || { cp '/usr/share/neteye/data/$f' '/var/lib/neteye/.$f.new' && mv -f '/var/lib/neteye/.$f.new' '/var/lib/neteye/$f'; }"
         fi
     done
 }

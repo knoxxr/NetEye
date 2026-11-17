@@ -4,15 +4,25 @@
 #   Threat list: abuse.ch Feodo Tracker C2 (CC0) + Spamhaus DROP, plus /etc/neteye/blocklist_custom.txt
 # The service reads the files at start: systemctl restart neteye
 set -eu
+# The data folder belongs to the service account: never write into it as root (a planted link
+# could redirect a root-owned write). Root re-runs this script as the neteye user.
+if [ "$(id -u)" -eq 0 ] && id neteye >/dev/null 2>&1; then
+    if command -v runuser >/dev/null; then exec runuser -u neteye -- /bin/sh "$0" "$@"; fi
+    if command -v setpriv >/dev/null; then exec setpriv --reuid=neteye --regid=neteye --init-groups /bin/sh "$0" "$@"; fi
+    exec su -s /bin/sh neteye -c "/bin/sh '$0'"
+fi
 DATA="${NETEYE_DATA:-/var/lib/neteye}"
 UA="NetEye-intel-updater"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 fetch() { curl -fsSL --max-time 120 -A "$UA" -o "$2" "$1"; }
+# Replace a data file atomically: copy next to it, then rename over it (rename replaces a link
+# itself rather than writing through it).
+replace() { cp "$1" "$DATA/.$2.new" && chmod 0644 "$DATA/.$2.new" && mv -f "$DATA/.$2.new" "$DATA/$2"; }
 
 if fetch https://iptoasn.com/data/ip2asn-v4.tsv.gz "$TMP/asn.gz" && gzip -t "$TMP/asn.gz"; then
-    install -m 0644 "$TMP/asn.gz" "$DATA/ip2asn-v4.tsv.gz"
+    replace "$TMP/asn.gz" ip2asn-v4.tsv.gz
     echo "IP 조직 DB 갱신: $DATA/ip2asn-v4.tsv.gz"
 else
     echo "IP 조직 DB를 받지 못했습니다 (기존 파일 유지)" >&2
@@ -32,9 +42,8 @@ fi
     fi
 } > "$TMP/blocklist.txt"
 if [ "$(grep -vc '^#' "$TMP/blocklist.txt")" -gt 0 ]; then
-    install -m 0644 "$TMP/blocklist.txt" "$DATA/blocklist.txt"
+    replace "$TMP/blocklist.txt" blocklist.txt
     echo "위협 목록 갱신: $DATA/blocklist.txt ($(grep -vc '^#' "$TMP/blocklist.txt")건)"
 else
     echo "위협 목록을 받지 못했습니다 (기존 파일 유지)" >&2
 fi
-chown neteye:neteye "$DATA/ip2asn-v4.tsv.gz" "$DATA/blocklist.txt" 2>/dev/null || true
