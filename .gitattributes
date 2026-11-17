@@ -1,0 +1,4 @@
+# Linux scripts and units must keep LF line endings on every checkout.
+*.sh text eol=lf
+packaging/linux/** text eol=lf
+*.service text eol=lf
