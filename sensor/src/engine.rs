@@ -150,6 +150,8 @@ const OVERFLOW_RECENT: usize = 50;
 const EXTERNAL_BUDGET_WINDOW_MS: i64 = 3_600_000;
 /// Internet peers per (alert kind, internal host) that get their own alert before a summary.
 const EXTERNAL_ALERT_PEERS: u32 = 20;
+/// The same for threat-list matches, which matter more and are rarer.
+const EXTERNAL_THREAT_PEERS: u32 = 200;
 
 /// Process points tracked across all devices (learned values, last value, states).
 pub const MAX_POINTS: usize = 100_000;
@@ -384,6 +386,11 @@ pub struct Engine {
     /// When true, new and re-opened alerts are queued for SIEM forwarding.
     pub emit_events: bool,
     events: Vec<(AlertKey, bool)>,
+    /// Summary/overflow alerts already waiting in `events` (repeat folds share one entry).
+    queued_folds: FxHashSet<AlertKey>,
+    /// After an eviction attempt that freed nothing, the next one waits until this time (or an
+    /// acknowledgement), so a full table is not rescanned for every new alert.
+    alert_room_retry_at: i64,
     /// Learned process values per written point.
     pub points: FxHashMap<PointKey, PointProfile>,
     dirty_points: Vec<PointKey>,
@@ -444,6 +451,8 @@ impl Engine {
             clock: 0,
             next_silence_check: 0,
             events: Vec::new(),
+            queued_folds: Default::default(),
+            alert_room_retry_at: 0,
             points: Default::default(),
             dirty_points: Default::default(),
             point_syms: Default::default(),
@@ -1067,7 +1076,6 @@ impl Engine {
         }
         // The first EXTERNAL_ALERT_PEERS internet peers per internal host get their own alert; more
         // (a scan, a spray from many sources) are folded into one summary listing the peers.
-        // Threat-list matches are never folded: every listed address gets its own alert.
         let threat = self.syms.get(title).starts_with("위협 인텔리전스");
         if self.external_alert_peers.len() >= 100_000 {
             self.external_alert_peers.clear();
@@ -1077,7 +1085,9 @@ impl Engine {
             *budget = (0, now);
         }
         let known = self.alerts.contains_key(&AlertKey { title, src, dst: Some(dst) });
-        let alert_key = if threat || known || budget.0 < EXTERNAL_ALERT_PEERS {
+        // Threat-list matches get a much larger budget than the other kinds, but still a bounded one.
+        let limit = if threat { EXTERNAL_THREAT_PEERS } else { EXTERNAL_ALERT_PEERS };
+        let alert_key = if known || budget.0 < limit {
             if !known {
                 budget.0 += 1;
             }
@@ -1109,9 +1119,9 @@ impl Engine {
                     }
                 }
             }
-            // Each new peer in a summary is forwarded to the SIEM as well.
-            if added && self.emit_events && self.events.len() < 100_000 {
-                self.events.push((k, false));
+            // New peers in a summary are forwarded to the SIEM as well (coalesced per drain).
+            if added {
+                self.queue_fold_event(k);
             }
             k
         };
@@ -1629,7 +1639,7 @@ impl Engine {
              baseline: Option<Item>) {
         let mut key = AlertKey { title, src, dst };
         let mut overflow = false;
-        if !self.alerts.contains_key(&key) && self.alerts.len() >= MAX_ALERTS && !self.make_alert_room() {
+        if !self.alerts.contains_key(&key) && self.alerts.len() >= MAX_ALERTS && !self.make_alert_room(now) {
             // Nothing can be evicted (every alert is open and medium or worse). High and critical
             // alerts are still admitted up to a hard limit; anything else is counted in a summary.
             let serious = matches!(severity, "critical" | "high");
@@ -1668,28 +1678,34 @@ impl Engine {
             alert.acknowledged = false; // re-opened by recurrence
             reopened = true;
         }
-        // Every folded alert is also forwarded, so the SIEM sees each one.
-        if overflow && !created && !reopened && self.emit_events && self.events.len() < 100_000 {
-            self.events.push((key, false));
+        if !alert.dirty {
+            alert.dirty = true;
+            self.dirty_alerts.push(key);
         }
         // Bounded so a stalled forwarder can never exhaust memory.
         if self.emit_events && (created || reopened) && self.events.len() < 100_000 {
             self.events.push((key, reopened));
         }
-        if !alert.dirty {
-            alert.dirty = true;
-            self.dirty_alerts.push(key);
+        // Folded alerts are forwarded too (coalesced per drain; the summary lists the recent ones).
+        if overflow && !created && !reopened {
+            self.queue_fold_event(key);
         }
     }
 
     /// Free space in a full alert table: acknowledged alerts first, then open low/info ones, oldest
     /// first, in batches. Open medium-or-worse alerts are never dropped. (Dropped alerts stay in
     /// the database.) Returns whether anything was freed.
-    fn make_alert_room(&mut self) -> bool {
+    fn make_alert_room(&mut self, now: i64) -> bool {
+        if now < self.alert_room_retry_at {
+            return false;
+        }
+        // Never evict what the store or the SIEM has not received yet.
+        let queued: FxHashSet<AlertKey> = self.events.iter().map(|(k, _)| *k).collect();
         let mut candidates: Vec<(bool, i64, AlertKey)> = self.alerts.iter()
-            .filter(|(_, a)| a.acknowledged || matches!(a.severity, "low" | "info"))
+            .filter(|(k, a)| (a.acknowledged || matches!(a.severity, "low" | "info")) && !a.dirty && !queued.contains(k))
             .map(|(k, a)| (!a.acknowledged, a.last_seen, *k)).collect();
         if candidates.is_empty() {
+            self.alert_room_retry_at = now + 60_000;
             return false;
         }
         candidates.sort_unstable_by_key(|c| (c.0, c.1));
@@ -1708,7 +1724,16 @@ impl Engine {
         alert.acknowledged = true;
         let key = alert.key;
         self.mark_alert(key);
+        self.alert_room_retry_at = 0; // acknowledged alerts can be evicted now
         true
+    }
+
+    /// Queue a SIEM event for a summary/overflow alert: one entry per alert until the forwarder
+    /// drains the queue, within a share that leaves room for new and reopened alerts.
+    fn queue_fold_event(&mut self, key: AlertKey) {
+        if self.emit_events && self.events.len() < 90_000 && self.queued_folds.insert(key) {
+            self.events.push((key, false));
+        }
     }
 
     fn mark_alert(&mut self, key: AlertKey) {
@@ -2315,6 +2340,7 @@ impl Engine {
     /// Drain queued alert notifications into SIEM events, with asset context.
     pub fn take_events(&mut self) -> Vec<crate::siem::SiemEvent> {
         let queued = std::mem::take(&mut self.events);
+        self.queued_folds.clear();
         let mut out = Vec::with_capacity(queued.len());
         for (key, reopened) in queued {
             let Some(a) = self.alerts.get(&key) else { continue };
