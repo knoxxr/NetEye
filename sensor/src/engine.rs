@@ -2297,8 +2297,22 @@ impl Engine {
     /// once per database (the caller records that it ran).
     pub fn run_migrations(&mut self) {
         self.forget_ephemeral_misidentification();
+        self.drop_ephemeral_links();
         self.acknowledge_p2p_inbound_alerts();
         self.generation += 1;
+    }
+
+    /// Conversations with the internet that earlier versions labelled with a port-only fieldbus
+    /// protocol (a client's random source port) are removed.
+    fn drop_ephemeral_links(&mut self) {
+        let suspect: Vec<Sym> = ["CC-Link IE Field Basic", "PROFINET CM"].iter().map(|p| self.syms.intern(p)).collect();
+        let internet = |k: AssetKey| matches!(k, AssetKey::Ip(ip) if self.is_internet(ip));
+        let stale: Vec<LinkKey> = self.links.keys()
+            .filter(|l| suspect.contains(&l.proto) && (internet(l.client) || internet(l.server))).copied().collect();
+        for key in stale {
+            self.links.remove(&key);
+            self.deleted_links.insert(key);
+        }
     }
 
     /// An early build reported UDP between two temporary ports (calls, P2P) as inbound access.

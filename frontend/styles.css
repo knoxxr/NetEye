@@ -313,6 +313,10 @@ footer { display: flex; justify-content: space-between; gap: 12px; padding: 16px
 .comm { margin-top: 7px; padding: 7px 8px; border: 1px solid rgba(133, 154, 183, .12); border-radius: 6px; background: rgba(255, 255, 255, .015); }
 .comm-head { display: flex; justify-content: space-between; gap: 8px; font: 10px Consolas, "Courier New", monospace; color: #cbd6e5; }
 .comm-head span { color: var(--cyan); margin: 0; font-size: 9px; }
+.comm-head a { color: inherit; cursor: pointer; }
+.comm-head a:hover { color: var(--cyan); }
+.comm-peer { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.comm-peer .ext-level { min-width: 0; padding: 0 4px; font-size: 9px; }
 .comm-cats { margin-top: 3px; color: var(--amber); font-size: 9px; }
 .op-list { margin: 4px 0 0; padding-left: 14px; color: var(--muted); font-size: 9px; line-height: 1.6; }
 .op-list em { color: var(--subtle); font-style: normal; }
@@ -482,3 +486,8 @@ body[data-role="operator"] [data-min-role="admin"] { display: none !important; }
 .point-kind.write { color: #ffb38a; background: rgba(255, 159, 90, .14); }
 .point-kind.read { color: #9ec3ff; background: rgba(112, 167, 255, .14); }
 .muted { color: var(--subtle); }
+/* Peer line in the communications list: inline badges, not the block labels of .detail-item. */
+.detail-item .comm-peer span { display: inline; margin: 0; font-size: 10px; color: inherit; }
+.detail-item .comm-peer .well { margin-left: 4px; padding: 0 4px; color: #9ff0e8; font-size: 9px; }
+.detail-item .comm-peer .mono { color: var(--subtle); }
+.detail-item .comm-peer .ext-level { color: #fff; }

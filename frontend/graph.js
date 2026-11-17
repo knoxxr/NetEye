@@ -27,7 +27,8 @@ class NetGraph {
     this.alertAssets = new Set();
     this.hover = null;
     this.lastUpdate = 0;
-    this.dirty = true;
+    this.layerDirty = true;
+    this.pulsing = new Set();
     this.width = 0;
     this.height = 0;
     this.dpr = 1;
@@ -210,7 +211,7 @@ class NetGraph {
     if (structural) {
       this.alpha = Math.max(this.alpha, this.nodeList.some((n) => !n.settled) ? 1 : 0.3);
     }
-    this.dirty = true;
+    this.layerDirty = true;
   }
 
   /** Re-run the last update with the current options (no packet diffing). */
@@ -269,16 +270,16 @@ class NetGraph {
     if (signature === this.groupSignature) return;
     this.groupSignature = signature;
     for (const n of this.nodes.values()) n.slot = null;
-    const CELL_X = 92, CELL_Y = 84;
+    const CELL_X = 150, CELL_Y = 118;
     const groups = [...members].map(([key, g]) => {
-      const rc = g.linked ? 60 + 52 * Math.sqrt(g.linked) : 0;
+      const rc = g.linked ? 90 + 80 * Math.sqrt(g.linked) : 0;
       const cols = g.idle.length ? Math.ceil(Math.sqrt(g.idle.length * 2.2)) : 0;
       const rows = cols ? Math.ceil(g.idle.length / cols) : 0;
       const w = Math.max(2 * rc, cols * CELL_X, 160);
       const h = 2 * rc + rows * CELL_Y + (rc && rows ? 20 : 0);
       return { key, ...g, rc, cols, rows, w, h: Math.max(h, 140) };
     }).sort((x, y) => (y.key === "~ext") - (x.key === "~ext") || y.h - x.h); // external first: its links stay short
-    const gap = 120;
+    const gap = 170;
     const rowLimit = Math.max(groups[0] ? groups[0].w : 0,
       Math.sqrt(groups.reduce((sum, g) => sum + (g.w + gap) * (g.h + gap), 0)) * 1.4);
     let x = 0, y = 0, rowHeight = 0, width = 0;
@@ -343,8 +344,8 @@ class NetGraph {
         const [p, q] = edge.na.placed ? [edge.na, edge.nb] : [edge.nb, edge.na];
         if (p.placed && !q.placed) {
           const angle = Math.random() * Math.PI * 2;
-          q.x = p.x + Math.cos(angle) * 90;
-          q.y = p.y + Math.sin(angle) * 90;
+          q.x = p.x + Math.cos(angle) * 140;
+          q.y = p.y + Math.sin(angle) * 140;
           q.placed = true;
         }
       }
@@ -378,7 +379,7 @@ class NetGraph {
     const nodes = this.nodeList;
     const n = nodes.length;
     if (!n) { this.alpha = 0; return; }
-    const ideal = 110;
+    const ideal = 160;
     const alpha = this.alpha;
     const repulse = ideal * ideal * 0.9;
     for (const node of nodes) { node.fx = 0; node.fy = 0; }
@@ -471,7 +472,7 @@ class NetGraph {
     this.canvas.width = Math.round(rect.width * this.dpr);
     this.canvas.height = Math.round(rect.height * this.dpr);
     if (!this.userMoved) this.fit(false);
-    this.dirty = true;
+    this.layerDirty = true;
   }
 
   bounds() {
@@ -490,7 +491,7 @@ class NetGraph {
       Math.min(this.width / (b.x1 - b.x0), this.height / (b.y1 - b.y0))));
     this.view = { k, x: this.width / 2 - ((b.x0 + b.x1) / 2) * k, y: this.height / 2 - ((b.y0 + b.y1) / 2) * k };
     if (user) this.userMoved = false;
-    this.dirty = true;
+    this.layerDirty = true;
   }
 
   zoomAt(factor, sx, sy) {
@@ -498,7 +499,7 @@ class NetGraph {
     const wx = (sx - this.view.x) / this.view.k, wy = (sy - this.view.y) / this.view.k;
     this.view = { k, x: sx - wx * k, y: sy - wy * k };
     this.userMoved = true;
-    this.dirty = true;
+    this.layerDirty = true;
   }
 
   zoomBy(factor) { this.zoomAt(factor, this.width / 2, this.height / 2); }
@@ -507,7 +508,7 @@ class NetGraph {
     this.flow = on;
     if (!on) this.particles = [];
     try { localStorage.setItem("neteye.flow", on ? "1" : "0"); } catch { /* storage unavailable */ }
-    this.dirty = true;
+    this.layerDirty = true;
   }
 
   toWorld(sx, sy) { return { x: (sx - this.view.x) / this.view.k, y: (sy - this.view.y) / this.view.k }; }
@@ -567,7 +568,7 @@ class NetGraph {
         this.userMoved = true;
       }
       drag.last = p;
-      this.dirty = true;
+      this.layerDirty = true;
     });
     const end = (e) => {
       this.pointers.delete(e.pointerId);
@@ -594,7 +595,7 @@ class NetGraph {
     this.canvas.style.cursor = node ? "pointer" : "grab";
     if (node === this.hover) { if (node) this.placeTooltip(p); return; }
     this.hover = node;
-    this.dirty = true;
+    this.layerDirty = true;
     if (!node) { this.hideTooltip(); return; }
     let out = 0, inn = 0, peers = 0;
     for (const edge of this.edgeList) {
@@ -641,27 +642,67 @@ class NetGraph {
     requestAnimationFrame(this.frame);
     if (document.hidden || !this.width) return;
     if (this.alpha > 0) {
-      const steps = this.nodeList.length > 800 ? 1 : 2;
-      for (let i = 0; i < steps && this.alpha > 0; i += 1) this.step();
+      // Layout gets a time budget per frame, so a large map settles over a few more frames
+      // instead of dropping frames.
+      const t0 = performance.now();
+      let steps = 0;
+      do { this.step(); steps += 1; } while (this.alpha > 0 && steps < 3 && performance.now() - t0 < 5);
       if (!this.userMoved) this.fit(false);
-      this.dirty = true;
+      this.layerDirty = true;
     }
-    if (this.particles.length || this.flashing) this.dirty = true;
     // The server sends nothing while the network is quiet: let link activity fade out then.
     if (this.lastUpdate && time - this.lastUpdate > 2500 && this.edgeList.some((e) => e.rate)) {
       this.edgeList.forEach((e) => { e.rate = 0; });
-      this.dirty = true;
+      this.layerDirty = true;
     }
-    if (!this.dirty) return;
-    this.dirty = false;
+    if (!this.layerDirty && !this.particles.length && !this.pulsing.size) return;
     this.draw(time);
   }
 
+  /**
+   * Layered drawing: links (with areas and labels) and nodes (with labels) are rendered into two
+   * off-screen images only when something they show changes (layout, view, data, selection).
+   * Every frame then stamps those two images and draws just what moves in between and on top:
+   * packets in flight and receive pulses.
+   */
   draw(now) {
-    const { ctx, view: { k, x: tx, y: ty }, dpr } = this;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, this.width, this.height);
-    ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+    // Big maps that are still settling refresh their layers at most 25 times a second; packets
+    // keep moving every frame on top of the last layers.
+    const interval = this.alpha > 0 && this.nodeList.length > 1500 ? 40 : 0;
+    if (!this.layers || (this.layerDirty && now - (this.layersAt || 0) >= interval)) {
+      this.renderLayers();
+      this.layerDirty = false;
+      this.layersAt = now;
+    }
+    const { ctx, canvas } = this;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(this.layers.edges, 0, 0);
+    this.drawParticles(now);
+    ctx.drawImage(this.layers.nodes, 0, 0);
+    this.drawPulses(now);
+  }
+
+  layerCanvas(name) {
+    if (!this.layers) this.layers = {};
+    let c = this.layers[name];
+    if (!c) { c = document.createElement("canvas"); this.layers[name] = c; }
+    if (c.width !== this.canvas.width || c.height !== this.canvas.height) {
+      c.width = this.canvas.width;
+      c.height = this.canvas.height;
+    }
+    return c.getContext("2d");
+  }
+
+  renderLayers() {
+    const ectx = this.layerCanvas("edges");
+    const nctx = this.layerCanvas("nodes");
+    const { view: { k, x: tx, y: ty }, dpr } = this;
+    for (const c of [ectx, nctx]) {
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      c.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+    }
     // Visible world rectangle, for culling.
     const vx0 = -tx / k - 60, vy0 = -ty / k - 60, vx1 = (this.width - tx) / k + 60, vy1 = (this.height - ty) / k + 80;
     const visible = (n) => n.x > vx0 && n.x < vx1 && n.y > vy0 && n.y < vy1;
@@ -669,6 +710,14 @@ class NetGraph {
     const focus = sel ? this.nodes.get(sel) : null;
     const px = 1 / k; // one screen pixel in world units
     const C = NetGraph.C;
+    const neighbours = new Set();
+    if (focus) {
+      for (const e of this.edgeList) {
+        if (e.na === focus) neighbours.add(e.nb);
+        else if (e.nb === focus) neighbours.add(e.na);
+      }
+    }
+    this.view_info = { vx0, vy0, vx1, vy1, focus, neighbours };
 
     // Everything of one look goes into a single path and is painted with one call: a canvas
     // spends its time per draw call, not per shape.
@@ -678,7 +727,7 @@ class NetGraph {
       if (!b) { b = { ...look, path: new Path2D() }; batches.set(key, b); }
       return b.path;
     };
-    const flush = () => {
+    const flush = (ctx) => {
       for (const b of batches.values()) {
         ctx.globalAlpha = b.alpha;
         if (b.fill) { ctx.fillStyle = b.fill; ctx.fill(b.path); }
@@ -695,135 +744,187 @@ class NetGraph {
     };
     const unit = Math.max(px, 0.5); // line widths stay constant on screen until zoomed in past 2x
 
-    const neighbours = new Set();
-    if (focus) {
-      for (const e of this.edgeList) {
-        if (e.na === focus) neighbours.add(e.nb);
-        else if (e.nb === focus) neighbours.add(e.na);
-      }
-    }
-
-    this.drawAreas(ctx, k, px, vx0, vx1);
-
-    // Edges and arrowheads (heads are skipped while they would be under 3 px)
-    const heads = k * 7 >= 3;
+    // ---- links layer: areas, links, arrowheads, protocol labels
+    this.drawAreas(ectx, k, px, vx0, vx1);
+    // Links are drawn in device pixels as 1-px lines only: browsers rasterise exact 1-px strokes
+    // on a fast path, while any other width (or a dash pattern) is tessellated and is two orders
+    // of magnitude slower with thousands of lines. Thicker links are several parallel 1-px lines;
+    // arrowheads are two 1-px strokes.
+    ectx.setTransform(1, 0, 0, 1, 0, 0);
+    const S = k * dpr;
+    const ox = tx * dpr, oy = ty * dpr;
+    const heads = k * 7 >= 3; // arrowheads are skipped while they would be under 3 px
     for (const e of this.edgeList) {
       const a = e.na, b = e.nb;
       if (!visible(a) && !visible(b)) continue;
       const related = !focus || a === focus || b === focus;
       const active = e.rate > 0;
-      const dashed = e.stale && !active;
-      const alpha = (dashed ? 0.25 : e.alert ? 0.95 : active ? 0.85 : 0.6) * (related ? 1 : 0.25)
+      const faded = e.stale && !active;
+      const alpha = (faded ? 0.4 : e.alert ? 1 : active ? 0.95 : 0.8) * (related ? 1 : 0.3)
         * (e.cross && !e.alert && !(focus && related) ? 0.6 : 1);
       const tier = NetGraph.tier(e.rate);
       const color = e.alert ? C.red : active ? NetGraph.HEAT[tier] : C.edge;
-      const weight = e.alert ? 2 : active ? 1.2 + tier * 0.9 : 1.2;
-      const look = `${color}|${alpha}`;
-      const line = path(`L${look}|${weight}|${dashed}`, { stroke: color, alpha, width: weight * unit, dash: dashed });
-      const dx = b.x - a.x, dy = b.y - a.y, len = Math.max(1, Math.hypot(dx, dy));
+      const strands = e.alert ? 2 : active ? Math.min(5, Math.round(1.2 + tier * 0.9)) : 1;
+      const line = path(`L${color}|${alpha}`, { stroke: color, alpha, width: 1 });
+      const ax = a.x * S + ox, ay = a.y * S + oy, bx = b.x * S + ox, by = b.y * S + oy;
+      const dx = bx - ax, dy = by - ay, len = Math.max(1, Math.hypot(dx, dy));
       const ux = dx / len, uy = dy / len;
-      const ra = 30 * a.scale, rb = 30 * b.scale;
-      line.moveTo(a.x + ux * ra, a.y + uy * ra);
-      line.lineTo(b.x - ux * rb, b.y - uy * rb);
+      const ra = 30 * a.scale * S, rb = 30 * b.scale * S;
+      const x1 = ax + ux * ra, y1 = ay + uy * ra, x2 = bx - ux * rb, y2 = by - uy * rb;
+      for (let i = 0; i < strands; i += 1) {
+        const o = i - (strands - 1) / 2; // perpendicular offset in device pixels
+        line.moveTo(x1 - uy * o, y1 + ux * o);
+        line.lineTo(x2 - uy * o, y2 + ux * o);
+      }
       if (!heads) continue;
-      const tips = path(`H${look}`, { fill: color, alpha });
-      if (e.toB) NetGraph.arrow(tips, b.x - ux * rb, b.y - uy * rb, ux, uy);
-      if (e.toA) NetGraph.arrow(tips, a.x + ux * ra, a.y + uy * ra, -ux, -uy);
+      const h = 7 * S;
+      if (e.toB) NetGraph.chevron(line, x2, y2, ux, uy, h);
+      if (e.toA) NetGraph.chevron(line, x1, y1, -ux, -uy, h);
     }
-    flush();
+    flush(ectx);
+    ectx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
     // Protocol labels: for the selected asset's links, or everywhere once zoomed in.
     if (focus || (k > 1.1 && this.edgeList.length < 400)) {
-      ctx.font = "9px Consolas, 'Courier New', monospace";
-      ctx.textAlign = "center";
-      ctx.fillStyle = C.edgeLabel;
+      ectx.font = "9px Consolas, 'Courier New', monospace";
+      ectx.textAlign = "center";
+      ectx.fillStyle = C.edgeLabel;
       for (const e of this.edgeList) {
         if (!e.label || (!visible(e.na) && !visible(e.nb))) continue;
         if (focus && e.na !== focus && e.nb !== focus) continue;
-        ctx.fillText(e.label, (e.na.x + e.nb.x) / 2, (e.na.y + e.nb.y) / 2 - 5);
+        ectx.fillText(e.label, (e.na.x + e.nb.x) / 2, (e.na.y + e.nb.y) / 2 - 5);
       }
     }
 
-    // Packets in flight: one pre-rendered dot image per colour, stamped with drawImage.
-    if (this.particles.length) {
-      const alive = [];
-      const base = Math.max(1, k); // dots grow once zoomed in past 1x
-      const groups = new Map();
-      for (const p of this.particles) {
-        if (now < p.start) { alive.push(p); continue; }
-        const e = p.edge;
-        const from = p.dir > 0 ? e.na : e.nb, to = p.dir > 0 ? e.nb : e.na;
-        if (!this.nodes.has(from.id) || !this.nodes.has(to.id)) continue;
-        if (!p.dur) {
-          const tier = NetGraph.tier(e.rate);
-          p.size = 1.8 + tier * 0.4;
-          p.dur = Math.min(1600, Math.max(300, Math.hypot(to.x - from.x, to.y - from.y) * (4.5 - tier * 0.6)));
-        }
-        const t = (now - p.start) / p.dur;
-        if (t >= 1) { to.flash = now; continue; }
-        alive.push(p);
-        const x = from.x + (to.x - from.x) * t, y = from.y + (to.y - from.y) * t;
-        if (x < vx0 || x > vx1 || y < vy0 || y > vy1) continue;
-        const color = e.alert ? C.red : p.kind === "req" ? C.req : C.resp;
-        const dim = focus && from !== focus && to !== focus;
-        const key = `${color}|${dim ? 1 : 0}|${p.size}`;
-        let g = groups.get(key);
-        if (!g) { g = { color, alpha: dim ? 0.3 : 1, size: p.size, xs: [] }; groups.set(key, g); }
-        g.xs.push(x, y);
-      }
-      for (const g of groups.values()) {
-        const rs = g.size * base;    // dot radius in screen pixels
-        const half = (rs * 2.4) / k; // half the sprite (glow included) in world units
-        const img = this.dotSprite(g.color, rs * dpr);
-        ctx.globalAlpha = g.alpha;
-        for (let i = 0; i < g.xs.length; i += 2) ctx.drawImage(img, g.xs[i] - half, g.xs[i + 1] - half, half * 2, half * 2);
-      }
-      ctx.globalAlpha = 1;
-      this.particles = alive;
-    }
-
-    // Nodes: one sprite per (type, state) at the current zoom, stamped with drawImage.
+    // ---- nodes layer: sprites (or plain squares when a node is a few pixels wide), labels
     const showText = k * 10 >= 5.5;
-    this.flashing = false;
     const drawn = [];
-    const pulses = [];
+    const tiny = [];
     let lastAlpha = 1;
     for (const n of this.nodeList) {
       if (!visible(n)) continue;
       drawn.push(n);
       const alpha = (n.offline ? 0.48 : 1) * (focus && n !== focus && !neighbours.has(n) ? 0.35 : 1);
-      const state = this.alertAssets.has(n.id) ? "alert" : n.id === sel ? "sel" : "";
       const s = n.scale;
+      if (k * dpr * 20 * s < 3) {
+        tiny.push(n, alpha);
+        continue;
+      }
+      const state = this.alertAssets.has(n.id) ? "alert" : n.id === sel ? "sel" : "";
       const img = this.nodeSprite(n.style, state, n.glyph, NetGraph.quantize(k * dpr * s), showText);
-      if (alpha !== lastAlpha) { ctx.globalAlpha = alpha; lastAlpha = alpha; }
-      ctx.drawImage(img, n.x - 32 * s, n.y - 32 * s, 64 * s, 64 * s);
-      const since = now - (n.flash || 0);
-      if (since < 450) pulses.push([n, since, alpha]);
+      if (alpha !== lastAlpha) { nctx.globalAlpha = alpha; lastAlpha = alpha; }
+      nctx.drawImage(img, n.x - 32 * s, n.y - 32 * s, 64 * s, 64 * s);
     }
-    ctx.globalAlpha = 1;
-    // Receive pulse: a ring that grows and fades when a packet arrives.
-    if (pulses.length) {
-      this.flashing = true;
-      ctx.lineWidth = 2 * px;
-      for (const [n, since, alpha] of pulses) {
-        ctx.globalAlpha = alpha * (1 - since / 450);
-        ctx.strokeStyle = n.style.stroke;
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, 29 * n.scale + since / 30, 0, Math.PI * 2);
-        ctx.stroke();
+    // Nodes only a few pixels wide: plain squares in device pixels.
+    if (tiny.length) {
+      nctx.setTransform(1, 0, 0, 1, 0, 0);
+      const S = k * dpr;
+      for (let i = 0; i < tiny.length; i += 2) {
+        const n = tiny[i];
+        const r = Math.max(1, 20 * n.scale * S);
+        nctx.globalAlpha = tiny[i + 1];
+        nctx.fillStyle = this.alertAssets.has(n.id) ? C.red : n.style.stroke;
+        nctx.fillRect((n.x * S + tx * dpr - r) | 0, (n.y * S + ty * dpr - r) | 0, Math.ceil(2 * r), Math.ceil(2 * r));
+      }
+      nctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+    }
+    nctx.globalAlpha = 1;
+    if (showText) {
+      nctx.textAlign = "center";
+      nctx.fillStyle = "#dce5f2";
+      nctx.font = "10px Consolas, 'Courier New', monospace";
+      for (const n of drawn) nctx.fillText(n.label, n.x, n.y + 19 + 20 * n.scale);
+      if (k > 0.8) {
+        nctx.fillStyle = "#8494a9";
+        nctx.font = "8px 'Segoe UI', 'Malgun Gothic', sans-serif";
+        for (const n of drawn) nctx.fillText(n.sub, n.x, n.y + 31 + 20 * n.scale);
+      }
+    }
+  }
+
+  /** Packets in flight, stamped in device pixels from pre-rendered dots (no scaling per dot). */
+  drawParticles(now) {
+    if (!this.particles.length) return;
+    const { ctx, view: { k, x: tx, y: ty }, dpr } = this;
+    const info = this.view_info || {};
+    const focus = info.focus;
+    const W = this.canvas.width, H = this.canvas.height;
+    const C = NetGraph.C;
+    const base = Math.max(1, k); // dots grow once zoomed in past 1x
+    const alive = [];
+    const groups = new Map();
+    for (const p of this.particles) {
+      if (now < p.start) { alive.push(p); continue; }
+      const e = p.edge;
+      const from = p.dir > 0 ? e.na : e.nb, to = p.dir > 0 ? e.nb : e.na;
+      if (!this.nodes.has(from.id) || !this.nodes.has(to.id)) continue;
+      if (!p.dur) {
+        const tier = NetGraph.tier(e.rate);
+        p.size = 1.8 + tier * 0.4;
+        p.dur = Math.min(1600, Math.max(300, Math.hypot(to.x - from.x, to.y - from.y) * (4.5 - tier * 0.6)));
+      }
+      const t = (now - p.start) / p.dur;
+      if (t >= 1) {
+        to.flash = now;
+        this.pulsing.add(to);
+        continue;
+      }
+      alive.push(p);
+      const sx = ((from.x + (to.x - from.x) * t) * k + tx) * dpr;
+      const sy = ((from.y + (to.y - from.y) * t) * k + ty) * dpr;
+      if (sx < -20 || sy < -20 || sx > W + 20 || sy > H + 20) continue;
+      const color = e.alert ? C.red : p.kind === "req" ? C.req : C.resp;
+      const dim = focus && from !== focus && to !== focus;
+      const key = `${color}|${dim ? 1 : 0}|${p.size}`;
+      let g = groups.get(key);
+      if (!g) { g = { color, alpha: dim ? 0.3 : 1, size: p.size, xs: [] }; groups.set(key, g); }
+      g.xs.push(sx, sy);
+    }
+    this.particles = alive;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    let visibleDots = 0;
+    for (const g of groups.values()) visibleDots += g.xs.length / 2;
+    if (visibleDots > 600) {
+      // Many dots: plain squares (solid fills are the cheapest thing a canvas draws).
+      for (const g of groups.values()) {
+        const size = Math.max(2, Math.round(g.size * base * dpr * 1.6));
+        const off = size / 2;
+        ctx.globalAlpha = g.alpha;
+        ctx.fillStyle = g.color;
+        for (let i = 0; i < g.xs.length; i += 2) ctx.fillRect((g.xs[i] - off) | 0, (g.xs[i + 1] - off) | 0, size, size);
       }
       ctx.globalAlpha = 1;
+      return;
     }
-    if (showText) {
-      ctx.textAlign = "center";
-      ctx.fillStyle = "#dce5f2";
-      ctx.font = "10px Consolas, 'Courier New', monospace";
-      for (const n of drawn) ctx.fillText(n.label, n.x, n.y + 19 + 20 * n.scale);
-      if (k > 0.8) {
-        ctx.fillStyle = "#8494a9";
-        ctx.font = "8px 'Segoe UI', 'Malgun Gothic', sans-serif";
-        for (const n of drawn) ctx.fillText(n.sub, n.x, n.y + 31 + 20 * n.scale);
+    for (const g of groups.values()) {
+      const img = this.dotSprite(g.color, g.size * base * dpr);
+      const off = img.width / 2;
+      ctx.globalAlpha = g.alpha;
+      for (let i = 0; i < g.xs.length; i += 2) ctx.drawImage(img, (g.xs[i] - off) | 0, (g.xs[i + 1] - off) | 0);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /** Receive pulse: a ring that grows and fades when a packet arrives. */
+  drawPulses(now) {
+    if (!this.pulsing.size) return;
+    const { ctx, view: { k, x: tx, y: ty }, dpr } = this;
+    const info = this.view_info || {};
+    ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+    ctx.lineWidth = 2 / k;
+    for (const n of this.pulsing) {
+      const since = now - (n.flash || 0);
+      if (since >= 450 || !this.nodes.has(n.id)) {
+        this.pulsing.delete(n);
+        continue;
       }
+      const dim = info.focus && n !== info.focus && !info.neighbours.has(n);
+      ctx.globalAlpha = (n.offline ? 0.48 : 1) * (dim ? 0.35 : 1) * (1 - since / 450);
+      ctx.strokeStyle = n.style.stroke;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 29 * n.scale + since / 30, 0, Math.PI * 2);
+      ctx.stroke();
     }
+    ctx.globalAlpha = 1;
   }
 
   /** Zoom levels share sprites in steps of 25 %, so zooming does not redraw them every frame. */
@@ -933,10 +1034,10 @@ class NetGraph {
       ctx.textAlign = "left";
       for (const level of [4, 3, 2, 1]) {
         if (!levels.has(level)) continue;
-        const y = NetGraph.LEVEL_Y[level] - 130;
+        const y = NetGraph.LEVEL_Y[level] - 180;
         ctx.globalAlpha = 1;
         ctx.fillStyle = level % 2 ? "rgba(112,167,255,.045)" : "rgba(69,214,203,.035)";
-        ctx.fillRect(vx0, y, vx1 - vx0, 260);
+        ctx.fillRect(vx0, y, vx1 - vx0, 360);
         ctx.strokeStyle = "rgba(133,154,183,.16)";
         ctx.lineWidth = px;
         ctx.beginPath(); ctx.moveTo(vx0, y); ctx.lineTo(vx1, y); ctx.stroke();
@@ -947,6 +1048,14 @@ class NetGraph {
       }
     }
     ctx.globalAlpha = 1;
+  }
+
+  /** An open arrowhead (two strokes) at (x, y) pointing along (ux, uy), in device pixels. */
+  static chevron(p, x, y, ux, uy, size) {
+    const bx = x - ux * size, by = y - uy * size;
+    p.moveTo(bx - uy * size * 0.5, by + ux * size * 0.5);
+    p.lineTo(x, y);
+    p.lineTo(bx + uy * size * 0.5, by - ux * size * 0.5);
   }
 
   static arrow(p, x, y, ux, uy) {
@@ -963,7 +1072,7 @@ NetGraph.MAX_PARTICLES = 2500;
 NetGraph.tier = (rate) => (rate <= 0 ? 0 : rate < 1 ? 1 : rate < 10 ? 2 : rate < 100 ? 3 : 4);
 NetGraph.HEAT = ["#53647b", "#6f8fc0", "#45d6cb", "#f2d06b", "#ff9f5a"];
 NetGraph.EXTERNAL = "~internet";
-NetGraph.LEVEL_Y = { 4: -420, 3: -140, 2: 140, 1: 420 };
+NetGraph.LEVEL_Y = { 4: -570, 3: -190, 2: 190, 1: 570 };
 NetGraph.LEVEL_LABEL = {
   4: "Level 4–5 · 외부망 / 인터넷",
   3: "Level 3 · 운영·IT망 (미분류 포함)",
@@ -973,7 +1082,7 @@ NetGraph.LEVEL_LABEL = {
 NetGraph.MIN_ZOOM = 0.08;
 NetGraph.MAX_ZOOM = 6;
 NetGraph.C = {
-  edge: "#53647b", edgeActive: "#6f86a3", edgeLabel: "#8394aa", red: "#ff6b6b", cyan: "#45d6cb",
+  edge: "#7d90aa", edgeActive: "#8fa3bf", edgeLabel: "#8394aa", red: "#ff6b6b", cyan: "#45d6cb",
   req: "#45d6cb", resp: "#70a7ff",
 };
 NetGraph.STYLES = {

@@ -1292,6 +1292,14 @@ fn hosts_misread_by_earlier_versions_are_reset_on_load() {
     let a = by_label(&snap(&mut e));
     assert_eq!(a["10.0.0.20"]["device_type"], "Unknown", "the PC that browses the internet is corrected");
     assert_eq!(a["10.0.1.6"]["device_type"], "CC-Link IE Field Basic station", "a real station is left alone");
+    let link = |a: &str, b: &str, p: &str| json!({"source": a, "target": b, "protocol": p, "packets": 1});
+    let mut e = Engine::new();
+    e.restore(vec![asset("10.0.0.20", "Unknown"), asset("8.8.8.8", "Unknown"), asset("10.0.1.6", "CC-Link IE Field Basic station")],
+              vec![link("10.0.0.20", "8.8.8.8", "CC-Link IE Field Basic"), link("10.0.1.5", "10.0.1.6", "CC-Link IE Field Basic")],
+              Vec::new(), None, Vec::new());
+    e.run_migrations();
+    let links = snap(&mut e)["links"].as_array().unwrap().clone();
+    assert_eq!(links.len(), 1, "only the internet link labelled from a source port is removed");
 }
 
 #[test]

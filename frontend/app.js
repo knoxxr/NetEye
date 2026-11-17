@@ -64,9 +64,36 @@ function formatTime(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("ko-KR", { hour12: false });
 }
 
+/** Asset by id, through an index built once per snapshot (lists and details look up many). */
+const assetIndexes = new WeakMap();
+function assetById(id) {
+  let index = assetIndexes.get(latestSnapshot);
+  if (!index) {
+    index = new Map((latestSnapshot.assets || []).map((a) => [a.id, a]));
+    assetIndexes.set(latestSnapshot, index);
+  }
+  return index.get(id);
+}
+
 function labelOf(id) {
-  const asset = (latestSnapshot.assets || []).find((item) => item.id === id);
+  const asset = assetById(id);
   return asset ? asset.label : id || "-";
+}
+
+/** Who a peer is, in one short line: entered name / computer name, organisation, domain. */
+function peerDescription(id) {
+  const asset = assetById(id);
+  if (!asset) return "";
+  const parts = [];
+  const named = (asset.manual && asset.manual.name) || asset.hostname;
+  if (named) parts.push(escapeHtml(named));
+  if (asset.org) {
+    parts.push(`${escapeHtml(asset.org.name)}${asset.org.well_known ? ' <span class="well">잘 알려진</span>' : ""}`);
+  }
+  const domain = (asset.domains || []).slice(-1)[0];
+  if (domain) parts.push(`<span class="mono">${escapeHtml(domain)}</span>`);
+  if (!parts.length && asset.device_type && asset.device_type !== "Unknown") parts.push(escapeHtml(asset.device_type));
+  return parts.join(" · ");
 }
 
 /** Replace an element's markup only when it changed: rebuilding unchanged tables every second is
@@ -301,21 +328,31 @@ function renderAssetDetail(asset) {
   const evidence = (asset.evidence || []).length
     ? `<ul class="evidence-list">${asset.evidence.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
     : "<span>아직 식별 근거가 없습니다.</span>";
-  const comms = (latestSnapshot.links || []).filter((l) => l.source === asset.id || l.target === asset.id);
+  // Busiest conversations first; long lists (a PC talking to hundreds of internet hosts) are cut.
+  const allComms = (latestSnapshot.links || []).filter((l) => l.source === asset.id || l.target === asset.id)
+    .sort((a, b) => b.packets - a.packets);
+  const comms = allComms.slice(0, 40);
+  const externalScore = new Map((latestSnapshot.external || []).map((e) => [e.id, e.score]));
   const commsHtml = comms.length ? comms.map((link) => {
     const outbound = link.source === asset.id;
-    const peer = labelOf(outbound ? link.target : link.source);
+    const peerId = outbound ? link.target : link.source;
+    const peer = labelOf(peerId);
+    const about = peerDescription(peerId);
+    const score = externalScore.get(peerId);
+    const [cls, level] = score !== undefined && score >= 30 ? levelOf(score) : ["", ""];
     const ops = Object.entries(link.operations || {}).sort((a, b) => b[1] - a[1]).slice(0, 6)
       .map(([op, n]) => `<li>${escapeHtml(op)} <em>×${n}</em></li>`).join("");
     const cats = Object.keys(link.categories || {}).map((c) => CATEGORY_LABEL[c] || c).join(", ");
     const profile = profileText(link.profile);
     return `<div class="comm">
-      <div class="comm-head"><b>${outbound ? "→" : "←"} ${escapeHtml(peer)}</b><span>${escapeHtml(link.protocol)}</span></div>
+      <div class="comm-head"><b>${outbound ? "→" : "←"} <a data-id="${escapeHtml(peerId)}">${escapeHtml(peer)}</a></b><span>${escapeHtml(link.protocol)}</span></div>
+      ${about || level ? `<div class="comm-peer ext-org">${level ? `<span class="ext-level ${cls}">${level}</span> ` : ""}${about}</div>` : ""}
       ${cats ? `<div class="comm-cats">${escapeHtml(cats)}</div>` : ""}
       ${profile ? `<div class="comm-profile" title="학습된 정상 패턴 (통계 이상 탐지 기준)">${escapeHtml(profile)}</div>` : ""}
       ${ops ? `<ul class="op-list">${ops}</ul>` : ""}
     </div>`;
-  }).join("") : "<span>관측된 통신이 없습니다.</span>";
+  }).join("") + (allComms.length > comms.length ? `<small class="more">패킷이 많은 ${comms.length}개만 표시 · 전체 ${allComms.length}개</small>` : "")
+    : "<span>관측된 통신이 없습니다.</span>";
 
   setHtml(assetDetail, `
     <div class="selected-asset">
