@@ -31,6 +31,8 @@ pub struct AppState {
     pub import: Arc<Mutex<Value>>,
     pub vulndb_state: Mutex<Value>,
     import_running: AtomicBool,
+    /// Live capture: generation (to ignore a stopping thread's last word) and its stop flag.
+    capture: Mutex<(u64, Option<Arc<AtomicBool>>)>,
     cache: Mutex<(u64, i64, Arc<String>)>,
     pub sessions: crate::auth::Sessions,
     /// Syslog/CEF forwarding to the SIEM, when NETEYE_SYSLOG is set.
@@ -48,6 +50,7 @@ impl AppState {
             sensor: Mutex::new(json!({"enabled": false, "interface": null, "error": null})),
             import: Arc::new(Mutex::new(json!({"running": false, "file": null, "frames": 0, "error": null, "last_result": null}))),
             import_running: AtomicBool::new(false),
+            capture: Mutex::new((0, None)),
             cache: Mutex::new((u64::MAX, 0, Arc::new(String::new()))),
             sessions: Default::default(),
             siem: None,
@@ -125,6 +128,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/users/{name}", post(account::update_user).delete(account::delete_user))
         .route("/api/audit", get(account::audit_log))
         .route("/api/integrations", get(integrations))
+        .route("/api/sensor", get(sensor_settings))
+        .route("/api/sensor/capture", post(set_capture_interface))
         // Layers run outermost-last: host/origin guard first, then authentication + audit.
         .layer(axum::middleware::from_fn_with_state(state.clone(), account::middleware))
         .layer(axum::middleware::from_fn_with_state(Arc::new(state.config.allowed_hosts.clone()),
@@ -132,11 +137,76 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Capture interfaces available on this machine and the current choice (administrators).
+async fn sensor_settings(State(s): State<Arc<AppState>>) -> Json<Value> {
+    let devices = tokio::task::spawn_blocking(crate::live::list_devices).await.unwrap();
+    let (interfaces, error) = match devices {
+        Ok(list) => (list.into_iter().map(|d| json!({"name": d.name, "description": d.description})).collect(), Value::Null),
+        Err(e) => (Vec::new(), Value::from(e)),
+    };
+    Json(json!({
+        "interfaces": interfaces, "error": error, "sensor": s.sensor.lock().clone(),
+        "config_file": crate::config_file().map(|p| p.display().to_string()),
+    }))
+}
+
+#[derive(Deserialize)]
+struct CaptureRequest {
+    interface: Option<String>,
+}
+
+/// Switch live capture to another interface (or stop it), and remember the choice.
+async fn set_capture_interface(State(s): State<Arc<AppState>>, Json(req): Json<CaptureRequest>) -> Response {
+    let interface = req.interface.map(|i| i.trim().to_string()).filter(|i| !i.is_empty());
+    if let Some(name) = &interface {
+        let known = tokio::task::spawn_blocking(crate::live::list_devices).await.unwrap()
+            .map(|list| list.iter().any(|d| &d.name == name)).unwrap_or(false);
+        if !known {
+            return error(StatusCode::BAD_REQUEST, "unknown capture interface");
+        }
+    }
+    let saved = crate::save_setting("NETEYE_INTERFACE", interface.as_deref().unwrap_or(""));
+    s.set_capture(interface);
+    s.invalidate();
+    match saved {
+        Ok(path) => Json(json!({"ok": true, "config_file": path.display().to_string()})).into_response(),
+        Err(e) => Json(json!({"ok": true, "warning": format!("수집은 전환했지만 설정 파일에 저장하지 못했습니다: {e}")})).into_response(),
+    }
+}
+
 async fn integrations(State(s): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"syslog": s.siem.as_ref().map(|f| f.status())}))
 }
 
 impl AppState {
+    /// Start live capture on `interface` (stopping any running capture first), or just stop it.
+    pub fn set_capture(self: &Arc<Self>, interface: Option<String>) {
+        let (generation, stop) = {
+            let mut capture = self.capture.lock();
+            if let Some(old) = capture.1.take() {
+                old.store(true, Ordering::Relaxed);
+            }
+            capture.0 += 1;
+            let stop = interface.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
+            capture.1 = stop.clone();
+            (capture.0, stop)
+        };
+        {
+            let mut sensor = self.sensor.lock();
+            sensor["interface"] = interface.clone().map(Value::from).unwrap_or(Value::Null);
+            sensor["enabled"] = false.into();
+            sensor["error"] = Value::Null;
+        }
+        if let (Some(interface), Some(stop)) = (interface, stop) {
+            start_live_capture(self.clone(), interface, stop, generation);
+        }
+        self.invalidate();
+    }
+
+    fn capture_current(&self, generation: u64) -> bool {
+        self.capture.lock().0 == generation
+    }
+
     /// Moves new/re-opened alerts from the engine to the SIEM forwarder (non-blocking queues).
     pub fn forward_events(&self) {
         if let Some(siem) = &self.siem {
@@ -374,4 +444,58 @@ async fn stream(mut socket: WebSocket, s: Arc<AppState>, token: String) {
         }
         last = Some(text);
     }
+}
+
+/// Capture thread: copies packets into a batch arena and applies each batch under one engine lock.
+fn start_live_capture(state: Arc<AppState>, interface: String, stop: Arc<AtomicBool>, generation: u64) {
+    std::thread::Builder::new().name("capture".into()).spawn(move || {
+        let mut arena: Vec<u8> = Vec::with_capacity(4 << 20);
+        let mut batch: Vec<(usize, usize, i64)> = Vec::with_capacity(1024);
+        let mut last_flush = std::time::Instant::now();
+        let flush = |arena: &mut Vec<u8>, batch: &mut Vec<(usize, usize, i64)>| {
+            if batch.is_empty() {
+                return;
+            }
+            let mut engine = state.engine.lock();
+            for (start, len, ts) in batch.drain(..) {
+                engine.process_raw(&arena[start..start + len], ts);
+            }
+            arena.clear();
+        };
+        let ready_state = state.clone();
+        let mut arena_cell = std::mem::take(&mut arena);
+        let mut batch_cell = std::mem::take(&mut batch);
+        let shared = std::cell::RefCell::new((&mut arena_cell, &mut batch_cell));
+        crate::live::capture(&interface, stop,
+            |result| {
+                // A capture that was replaced in the meantime must not overwrite the new status.
+                if !ready_state.capture_current(generation) {
+                    return;
+                }
+                let mut sensor = ready_state.sensor.lock();
+                match result {
+                    Ok(()) => sensor["enabled"] = true.into(),
+                    Err(e) => sensor["error"] = e.into(),
+                }
+            },
+            |data, ts| {
+                let mut cells = shared.borrow_mut();
+                let (arena, batch) = &mut *cells;
+                batch.push((arena.len(), data.len(), ts));
+                arena.extend_from_slice(data);
+                if batch.len() >= 1024 || last_flush.elapsed() >= Duration::from_millis(20) {
+                    flush(arena, batch);
+                    last_flush = std::time::Instant::now();
+                }
+            },
+            || {
+                let mut cells = shared.borrow_mut();
+                let (arena, batch) = &mut *cells;
+                flush(arena, batch);
+            });
+        if state.capture_current(generation) {
+            state.sensor.lock()["enabled"] = false.into();
+        }
+        state.invalidate();
+    }).expect("spawn capture thread");
 }

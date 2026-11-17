@@ -30,7 +30,6 @@ mod tests;
 use engine::Engine;
 use parking_lot::{Mutex, MutexGuard};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +48,91 @@ pub struct Config {
     pub learning_hours: f64,
     pub allowed_hosts: guard::AllowedHosts,
     pub cookie_secure: bool,
+}
+
+/// The settings file: NETEYE_CONFIG, else `neteye.conf` next to the program, else the platform
+/// location used by the installers (/etc/neteye/neteye.conf, %ProgramData%\NetEye\neteye.conf).
+pub fn config_file() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("NETEYE_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        candidates.push(dir.join("neteye.conf"));
+    }
+    if cfg!(windows) {
+        if let Some(pd) = std::env::var_os("ProgramData") {
+            candidates.push(PathBuf::from(pd).join("NetEye").join("neteye.conf"));
+        }
+    } else {
+        candidates.push(PathBuf::from("/etc/neteye/neteye.conf"));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// `${NAME}` and `%NAME%` in a setting are replaced by environment variables (e.g. ${ProgramData}).
+fn expand(value: &str) -> String {
+    let mut out = value.to_string();
+    for (open, close) in [("${", "}"), ("%", "%")] {
+        let mut from = 0;
+        while let Some(start) = out[from..].find(open).map(|i| i + from) {
+            let Some(end) = out[start + open.len()..].find(close).map(|i| i + start + open.len()) else { break };
+            let name = &out[start + open.len()..end];
+            match std::env::var(name) {
+                Ok(v) if !name.is_empty() => {
+                    out.replace_range(start..end + close.len(), &v);
+                    from = start + v.len();
+                }
+                _ => from = end + close.len(),
+            }
+        }
+    }
+    out
+}
+
+/// Read `KEY=VALUE` lines (`#` comments, optional quotes) into the environment. Variables that are
+/// already set win, so a service manager or the command line can override the file.
+fn load_config_file() -> Option<PathBuf> {
+    let path = config_file()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=').filter(|_| !line.starts_with('#')) else { continue };
+        let key = key.trim();
+        if !key.starts_with("NETEYE_") || std::env::var_os(key).is_some() {
+            continue;
+        }
+        let value = expand(value.trim().trim_matches('"'));
+        // SAFETY: called at the very start of main, before any other thread exists.
+        unsafe { std::env::set_var(key, value) };
+    }
+    Some(path)
+}
+
+/// Set one key in the settings file (created if missing), keeping every other line as it is.
+pub fn save_setting(key: &str, value: &str) -> Result<PathBuf, String> {
+    let path = config_file().unwrap_or_else(|| {
+        std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("neteye.conf")))
+            .unwrap_or_else(|| PathBuf::from("neteye.conf"))
+    });
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut found = false;
+    let mut lines: Vec<String> = text.lines().map(|line| {
+        let t = line.trim_start();
+        if !t.starts_with('#') && t.split_once('=').is_some_and(|(k, _)| k.trim() == key) {
+            found = true;
+            format!("{key}={value}")
+        } else {
+            line.to_string()
+        }
+    }).collect();
+    if !found {
+        lines.push(format!("{key}={value}"));
+    }
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 fn env(name: &str) -> Option<String> {
@@ -171,6 +255,7 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
 }
 
 fn main() {
+    let _ = load_config_file();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = if args.is_empty() { "serve".to_string() } else { args.remove(0) };
     let result = match command.as_str() {
@@ -179,6 +264,10 @@ fn main() {
         "replay" => cmd_replay(args),
         "bench" => cmd_bench(args),
         "interfaces" => cmd_interfaces(),
+        "config" => {
+            println!("{}", config_file().map(|p| p.display().to_string()).unwrap_or_else(|| "(설정 파일 없음)".into()));
+            Ok(())
+        }
         "user" => cmd_user(args),
         "-h" | "--help" | "help" => {
             println!("{}", include_str!("main.rs").lines().take(9).map(|l| l.trim_start_matches("//!")).collect::<Vec<_>>().join("\n"));
@@ -486,11 +575,10 @@ fn serve() -> Result<(), String> {
     app_state.siem = forwarder;
     let state = Arc::new(app_state);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    if let Some(interface) = config.interface.clone() {
-        state.sensor.lock()["interface"] = interface.clone().into();
-        start_live_capture(state.clone(), interface, stop.clone());
+    if let Some(path) = config_file() {
+        println!("설정 파일: {}", path.display());
     }
+    state.set_capture(config.interface.clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
     runtime.block_on(async move {
@@ -519,55 +607,9 @@ fn serve() -> Result<(), String> {
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
             .await.map_err(|e| e.to_string())?;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        state.set_capture(None);
         state.flush();
         Ok::<(), String>(())
     })
 }
 
-/// Capture thread: copies packets into a batch arena and applies each batch under one engine lock.
-fn start_live_capture(state: Arc<api::AppState>, interface: String, stop: Arc<AtomicBool>) {
-    std::thread::Builder::new().name("capture".into()).spawn(move || {
-        let mut arena: Vec<u8> = Vec::with_capacity(4 << 20);
-        let mut batch: Vec<(usize, usize, i64)> = Vec::with_capacity(1024);
-        let mut last_flush = Instant::now();
-        let flush = |arena: &mut Vec<u8>, batch: &mut Vec<(usize, usize, i64)>| {
-            if batch.is_empty() {
-                return;
-            }
-            let mut engine = state.engine.lock();
-            for (start, len, ts) in batch.drain(..) {
-                engine.process_raw(&arena[start..start + len], ts);
-            }
-            arena.clear();
-        };
-        let ready_state = state.clone();
-        let mut arena_cell = std::mem::take(&mut arena);
-        let mut batch_cell = std::mem::take(&mut batch);
-        let shared = std::cell::RefCell::new((&mut arena_cell, &mut batch_cell));
-        live::capture(&interface, stop,
-            |result| {
-                let mut sensor = ready_state.sensor.lock();
-                match result {
-                    Ok(()) => sensor["enabled"] = true.into(),
-                    Err(e) => sensor["error"] = e.into(),
-                }
-            },
-            |data, ts| {
-                let mut cells = shared.borrow_mut();
-                let (arena, batch) = &mut *cells;
-                batch.push((arena.len(), data.len(), ts));
-                arena.extend_from_slice(data);
-                if batch.len() >= 1024 || last_flush.elapsed() >= Duration::from_millis(20) {
-                    flush(arena, batch);
-                    last_flush = Instant::now();
-                }
-            },
-            || {
-                let mut cells = shared.borrow_mut();
-                let (arena, batch) = &mut *cells;
-                flush(arena, batch);
-            });
-        state.sensor.lock()["enabled"] = false.into();
-    }).expect("spawn capture thread");
-}

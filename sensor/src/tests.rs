@@ -1393,3 +1393,23 @@ fn threat_list_matches_are_never_folded() {
     let threat = s["alerts"].as_array().unwrap().iter().filter(|a| a["title"] == "위협 인텔리전스 목록 주소와 통신").count();
     assert_eq!(threat, 40);
 }
+
+// ------------------------------------------------------------ settings file
+#[test]
+fn settings_file_values_expand_and_update_in_place() {
+    // SAFETY: test-only variables with unique names; no other test reads them.
+    unsafe { std::env::set_var("NETEYE_TEST_BASE", "/srv/neteye") };
+    assert_eq!(crate::expand("${NETEYE_TEST_BASE}/db.bdb"), "/srv/neteye/db.bdb");
+    assert_eq!(crate::expand("%NETEYE_TEST_BASE%/db.bdb"), "/srv/neteye/db.bdb");
+    assert_eq!(crate::expand("${NETEYE_TEST_UNSET}/x"), "${NETEYE_TEST_UNSET}/x");
+
+    let path = std::env::temp_dir().join(format!("neteye-conf-{}.conf", std::process::id()));
+    std::fs::write(&path, "# NetEye\nNETEYE_PORT=8000\nNETEYE_INTERFACE=eth0\n").unwrap();
+    unsafe { std::env::set_var("NETEYE_CONFIG", &path) };
+    crate::save_setting("NETEYE_INTERFACE", "eth1").unwrap();
+    crate::save_setting("NETEYE_HOST", "0.0.0.0").unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    unsafe { std::env::remove_var("NETEYE_CONFIG") };
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(text, "# NetEye\nNETEYE_PORT=8000\nNETEYE_INTERFACE=eth1\nNETEYE_HOST=0.0.0.0\n");
+}

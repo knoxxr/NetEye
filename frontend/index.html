@@ -259,6 +259,20 @@
       <section class="alerts-panel admin-panel" data-min-role="admin">
         <div class="panel-heading">
           <div>
+            <h2>패킷 수집 설정</h2>
+            <p>미러링(SPAN) 포트에 연결된 랜카드를 고르면 바로 수집을 시작하고, 설정 파일에 저장해 다음 시작 때도 씁니다.</p>
+          </div>
+        </div>
+        <form id="capture-form" class="user-form">
+          <select id="capture-interface-select" aria-label="수집 인터페이스"><option value="">불러오는 중…</option></select>
+          <button class="button" type="submit">적용</button>
+          <span id="capture-form-status" class="import-status"></span>
+        </form>
+      </section>
+
+      <section class="alerts-panel admin-panel" data-min-role="admin">
+        <div class="panel-heading">
+          <div>
             <h2>사용자 및 감사 로그</h2>
             <p>조회자: 보기 전용 · 운영자: 경고 확인/정상 등록, PCAP 분석 · 관리자: 모드 변경, 취약점 DB, 사용자 관리</p>
           </div>

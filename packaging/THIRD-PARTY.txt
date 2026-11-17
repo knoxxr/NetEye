@@ -1,0 +1,15 @@
+NetEye bundles or uses the following third-party components and data.
+
+BangDB (database engine)            https://github.com/knoxxr/bangdb
+WinSW (Windows service wrapper)     https://github.com/winsw/winsw            MIT License
+IP-to-ASN database (iptoasn.com)    https://iptoasn.com/                      Public Domain (PDDL v1.0)
+CISA ICS advisories / KEV catalog   https://www.cisa.gov/                     U.S. Government work (public domain)
+
+Downloaded at install or update time, not redistributed:
+Npcap (Windows packet capture)      https://npcap.com/                         Npcap License (accepted by the user
+                                                                               in the official Npcap installer)
+abuse.ch Feodo Tracker blocklist    https://feodotracker.abuse.ch/             CC0
+Spamhaus DROP list                  https://www.spamhaus.org/drop/             Spamhaus DROP terms of use
+libpcap (Linux)                     installed from the distribution            BSD License
+
+Rust crates used by the sensor are listed in sensor/Cargo.lock with their licenses (MIT / Apache-2.0).
