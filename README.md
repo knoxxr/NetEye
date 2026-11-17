@@ -425,7 +425,7 @@ REST/WebSocket API와 대시보드는 이전과 같습니다. Python 버전을 �
 ## 검증
 
 ```powershell
-cd sensor; cargo test --release                       # 테스트 67개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
+cd sensor; cargo test --release                       # 테스트 69개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
                                                       # (저장 테스트는 실제 인메모리 bangdb를 띄우므로 먼저 빌드 필요)
 python tools/differential.py <pcap 폴더> --vulndb vulndb.json   # Rust와 기준 엔진을 필드 단위로 비교
 ```

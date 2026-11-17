@@ -1071,3 +1071,44 @@ fn operator_entered_details_override_and_drive_vulnerability_matching() {
     let a = &by_label(&snap(&mut e))["10.0.0.10"];
     assert!(a.get("manual").is_none() && a["vendor"] == "" && a["vulns"].as_array().unwrap().is_empty());
 }
+
+// ------------------------------------------------------------ hostile input
+#[test]
+fn truncated_pcapng_option_is_rejected_without_panicking() {
+    let mut f = Vec::new();
+    // Section header block (28 bytes), little endian.
+    f.extend([0x0A, 0x0D, 0x0D, 0x0A]);
+    f.extend(28u32.to_le_bytes());
+    f.extend([0x4D, 0x3C, 0x2B, 0x1A, 1, 0, 0, 0]);
+    f.extend([0xFF; 8]);
+    f.extend(28u32.to_le_bytes());
+    // Interface block whose if_tsresol option (code 9, length 1) has no value byte.
+    f.extend(1u32.to_le_bytes());
+    f.extend(24u32.to_le_bytes());
+    f.extend([1, 0, 0, 0, 0xFF, 0xFF, 0, 0]);
+    f.extend([9, 0, 1, 0]);
+    f.extend(24u32.to_le_bytes());
+    let path = std::env::temp_dir().join(format!("neteye-trunc-{}.pcapng", std::process::id()));
+    std::fs::write(&path, &f).unwrap();
+    let result = std::panic::catch_unwind(|| crate::pcap::read_file(&path, |_, _| {}));
+    let _ = std::fs::remove_file(&path);
+    assert!(result.is_ok(), "malformed capture must not panic the importer");
+}
+
+#[test]
+fn write_sweeps_over_unlearned_addresses_fold_into_one_alert() {
+    let mut e = Engine::new();
+    feed(&mut e, &[setpoint(1200), setpoint(1300), setpoint(1400)], T0);
+    e.set_mode(Mode::Detecting, None, false);
+    // An attacker writes to 60 registers it never touched before.
+    let sweep: Vec<Vec<u8>> = (200..260u16).map(|reg| {
+        let r = reg.to_be_bytes();
+        tcp("10.0.6.20", "10.0.6.10", 50000, 502, &mbap(1, &[6, r[0], r[1], 0, 1]))
+    }).collect();
+    feed(&mut e, &sweep, T0 + 60_000);
+    let alerts = anomaly_alerts(&mut e);
+    let individual = alerts.iter().filter(|a| a["title"].as_str().unwrap().starts_with("학습되지 않은 주소에 쓰기: ")).count();
+    let summary: Vec<&Value> = alerts.iter().filter(|a| a["title"] == "학습되지 않은 주소에 쓰기 (다수 주소)").collect();
+    assert_eq!((individual, summary.len()), (20, 1));
+    assert_eq!(summary[0]["count"], 40);
+}

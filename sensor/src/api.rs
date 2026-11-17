@@ -327,7 +327,10 @@ async fn upload_pcap(State(s): State<Arc<AppState>>, headers: HeaderMap, body: B
     let state = s.clone();
     std::thread::spawn(move || {
         let import = state.import.clone();
-        let result = import_file(&state.engine, &temp, move |n| { import.lock()["frames"] = n.into(); });
+        // A parser bug on a hostile capture must not leave the import slot stuck as "running".
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            import_file(&state.engine, &temp, move |n| { import.lock()["frames"] = n.into(); })
+        })).unwrap_or_else(|_| Err(std::io::Error::other("캡처 파일 분석 중 내부 오류 (손상된 파일)")));
         {
             let mut st = state.import.lock();
             match result {

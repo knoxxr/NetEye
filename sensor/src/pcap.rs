@@ -140,7 +140,8 @@ fn read_pcapng(r: &mut impl Read, first: [u8; 4], on_frame: &mut impl FnMut(&[u8
                         break;
                     }
                     if code == 9 && olen >= 1 {
-                        let v = body[o + 4];
+                        // A truncated option must not index past the block (malformed uploads).
+                        let Some(&v) = body.get(o + 4) else { break };
                         resolution = if v & 0x80 != 0 { 1u64 << (v & 0x7F).min(63) } else { 10u64.pow((v as u32).min(18)) };
                     }
                     o += 4 + (olen as usize).div_ceil(4) * 4;
