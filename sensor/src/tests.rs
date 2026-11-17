@@ -1111,4 +1111,36 @@ fn write_sweeps_over_unlearned_addresses_fold_into_one_alert() {
     let summary: Vec<&Value> = alerts.iter().filter(|a| a["title"] == "학습되지 않은 주소에 쓰기 (다수 주소)").collect();
     assert_eq!((individual, summary.len()), (20, 1));
     assert_eq!(summary[0]["count"], 40);
+    assert_eq!(summary[0]["severity"], "high");
+    // Every swept address stays visible in the summary.
+    let listed = summary[0]["details"]["points"].as_array().unwrap();
+    assert_eq!(listed.len(), 40);
+    assert!(listed.contains(&json!("u1 HR259")));
+}
+
+#[test]
+fn a_full_point_table_still_reports_writes_to_unknown_addresses() {
+    let mut e = Engine::new();
+    // Learn MAX_POINTS registers: two units x 50,000 holding registers, 16 per write.
+    let mut frames = Vec::new();
+    for unit in [1u8, 2] {
+        for start in (0..50_000u16).step_by(16) {
+            let mut pdu = vec![16];
+            pdu.extend(start.to_be_bytes());
+            pdu.extend(16u16.to_be_bytes());
+            pdu.push(32);
+            pdu.extend([0u8; 32]);
+            frames.push(tcp("10.0.6.20", "10.0.6.10", 50000, 502, &mbap(unit, &pdu)));
+        }
+    }
+    feed(&mut e, &frames, T0);
+    assert_eq!(e.points.len(), crate::engine::MAX_POINTS);
+    e.set_mode(Mode::Detecting, None, false);
+    feed(&mut e, &[tcp("10.0.6.20", "10.0.6.10", 50000, 502, &mbap(3, &[6, 0, 7, 0, 1]))], T0 + 600_000_000);
+    let alerts = anomaly_alerts(&mut e);
+    let titles: Vec<&str> = alerts.iter().map(|a| a["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"공정 포인트 추적 한도 도달"), "{titles:?}");
+    let sweep = alerts.iter().find(|a| a["title"] == "학습되지 않은 주소에 쓰기 (다수 주소)").expect("write still reported");
+    assert_eq!(sweep["details"]["points"], json!(["u3 HR7"]));
+    assert_eq!(e.points.len(), crate::engine::MAX_POINTS, "nothing more is stored");
 }

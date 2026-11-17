@@ -155,50 +155,106 @@ fn expired(s: &Session, now: Instant) -> bool {
 
 // -------------------------------------------------------------- throttling
 #[derive(Default)]
-/// Failed sign-ins per (account, client address). Keying on the pair means someone guessing from
-/// one machine cannot lock the real user out from another (lockout as a denial of service); each
-/// source still gets only MAX_FAILURES guesses per LOCKOUT, on top of Argon2's cost per guess.
+/// Sign-in throttling for existing accounts, at two levels:
+/// - per (account, client): MAX_FAILURES guesses, then that client is locked out for LOCKOUT;
+/// - per account: ACCOUNT_FAILURES failures from anywhere within ACCOUNT_WINDOW put the account
+///   under guard for LOCKOUT, during which only clients that signed in to it before may try.
+///
+/// Distributed guessing is capped by the account budget, while the real user (on a known machine)
+/// is never locked out by someone else's guesses. Unknown user names are not tracked at all, so
+/// made-up names cannot fill the tables; active locks are never evicted.
 pub struct Throttle {
-    map: Mutex<HashMap<(String, String), Attempts>>,
+    state: Mutex<ThrottleState>,
 }
 
-/// Consecutive failures and, once locked, until when.
-type Attempts = (u32, Option<Instant>);
+#[derive(Default)]
+struct ThrottleState {
+    /// (account, client) -> (consecutive failures, locked until)
+    pairs: HashMap<(String, String), (u32, Option<Instant>)>,
+    /// account -> (failures in window, window start, guarded until)
+    accounts: HashMap<String, (u32, Instant, Option<Instant>)>,
+    /// account -> clients that signed in successfully (most recent last)
+    trusted: HashMap<String, Vec<String>>,
+}
 
-/// Upper bound on tracked (account, client) pairs.
-const THROTTLE_ENTRIES: usize = 10_000;
+const ACCOUNT_FAILURES: u32 = 20;
+const ACCOUNT_WINDOW: Duration = Duration::from_secs(15 * 60);
+const THROTTLE_PAIRS: usize = 10_000;
+const TRUSTED_PER_ACCOUNT: usize = 16;
+
+/// IPv6 clients are counted per /64, the block one subscriber usually controls.
+pub fn client_bucket(ip: &str) -> String {
+    match ip.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Ok(v6) => v6.to_ipv4_mapped().unwrap().to_string(),
+        Err(_) => ip.to_string(),
+    }
+}
 
 impl Throttle {
-    fn key(username: &str, client: &str) -> (String, String) {
-        (username.to_string(), client.to_string())
-    }
-    /// Remaining lockout, if this account is currently locked for this client.
+    /// Remaining lockout for this account from this client, if any.
     pub fn locked(&self, username: &str, client: &str) -> Option<Duration> {
-        let map = self.map.lock();
-        let until = map.get(&Self::key(username, client))?.1?;
-        until.checked_duration_since(Instant::now())
+        let client = client_bucket(client);
+        let st = self.state.lock();
+        let now = Instant::now();
+        let pair = st.pairs.get(&(username.to_string(), client.clone())).and_then(|p| p.1)
+            .and_then(|until| until.checked_duration_since(now));
+        let trusted = st.trusted.get(username).is_some_and(|c| c.contains(&client));
+        let guard = st.accounts.get(username).and_then(|a| a.2)
+            .and_then(|until| until.checked_duration_since(now)).filter(|_| !trusted);
+        pair.max(guard)
     }
-    pub fn failure(&self, username: &str, client: &str) {
-        let mut map = self.map.lock();
-        if map.len() >= THROTTLE_ENTRIES {
-            // Keep active lockouts; forget plain counters and expired locks.
-            let now = Instant::now();
-            map.retain(|_, (_, until)| until.is_some_and(|u| u > now));
-            if map.len() >= THROTTLE_ENTRIES {
-                map.clear();
+
+    /// A failed sign-in. `exists`: whether the account exists (unknown names are not tracked).
+    pub fn failure(&self, username: &str, client: &str, exists: bool) {
+        if !exists {
+            return;
+        }
+        let client = client_bucket(client);
+        let mut st = self.state.lock();
+        let now = Instant::now();
+
+        let account = st.accounts.entry(username.to_string()).or_insert((0, now, None));
+        if now.duration_since(account.1) > ACCOUNT_WINDOW {
+            *account = (0, now, account.2.filter(|until| *until > now));
+        }
+        account.0 += 1;
+        if account.0 >= ACCOUNT_FAILURES {
+            account.2 = Some(now + LOCKOUT);
+        }
+
+        let key = (username.to_string(), client);
+        if !st.pairs.contains_key(&key) && st.pairs.len() >= THROTTLE_PAIRS {
+            // Make room by forgetting plain counters and expired locks; active locks stay. If the
+            // table is still full, this client is covered by the account budget alone.
+            st.pairs.retain(|_, (_, until)| until.is_some_and(|u| u > now));
+            if st.pairs.len() >= THROTTLE_PAIRS {
+                return;
             }
         }
-        let entry = map.entry(Self::key(username, client)).or_insert((0, None));
-        if entry.1.is_some_and(|until| until <= Instant::now()) {
+        let entry = st.pairs.entry(key).or_insert((0, None));
+        if entry.1.is_some_and(|until| until <= now) {
             *entry = (0, None); // previous lock elapsed: start counting again
         }
         entry.0 += 1;
         if entry.0 >= MAX_FAILURES {
-            entry.1 = Some(Instant::now() + LOCKOUT);
+            entry.1 = Some(now + LOCKOUT);
         }
     }
+
     pub fn success(&self, username: &str, client: &str) {
-        self.map.lock().remove(&Self::key(username, client));
+        let client = client_bucket(client);
+        let mut st = self.state.lock();
+        st.pairs.remove(&(username.to_string(), client.clone()));
+        let trusted = st.trusted.entry(username.to_string()).or_default();
+        trusted.retain(|c| *c != client);
+        trusted.push(client);
+        if trusted.len() > TRUSTED_PER_ACCOUNT {
+            trusted.remove(0);
+        }
     }
 }
 
@@ -280,15 +336,32 @@ mod tests {
     fn throttle_locks_after_repeated_failures() {
         let throttle = Throttle::default();
         let (here, there) = ("10.0.0.5", "10.0.0.6");
+        throttle.success("admin", there); // the real admin signs in from "there"
         for _ in 0..MAX_FAILURES - 1 {
-            throttle.failure("admin", here);
+            throttle.failure("admin", here, true);
         }
         assert!(throttle.locked("admin", here).is_none());
-        throttle.failure("admin", here);
+        throttle.failure("admin", here, true);
         assert!(throttle.locked("admin", here).is_some());
         assert!(throttle.locked("admin", there).is_none(), "guessing elsewhere does not lock the real user out");
         throttle.success("admin", here);
         assert!(throttle.locked("admin", here).is_none());
+
+        // Guessing spread over many addresses trips the account budget: new clients are held off,
+        // the admin's known machine is not.
+        for i in 0..40 {
+            throttle.failure("admin", &format!("192.0.2.{i}"), true);
+        }
+        assert!(throttle.locked("admin", "198.51.100.7").is_some());
+        assert!(throttle.locked("admin", there).is_none());
+
+        // Made-up names are not tracked; IPv6 counts per /64.
+        for i in 0..10 {
+            throttle.failure(&format!("nobody{i}"), here, false);
+        }
+        assert!(throttle.locked("nobody0", here).is_none());
+        assert_eq!(client_bucket("2001:db8:1:2:aaaa::1"), client_bucket("2001:db8:1:2:bbbb::9"));
+        assert_eq!(client_bucket("10.0.0.5"), "10.0.0.5");
     }
 
     #[test]
