@@ -143,6 +143,12 @@ pub struct ManualInfo {
     pub updated_at: String,
 }
 
+/// Distinct alerts kept (each one aggregates every repetition of the same event).
+const MAX_ALERTS: usize = 50_000;
+const ALERT_OVERFLOW_TITLE: &str = "경고 수 한도 도달 (이후 새 경고는 이 항목에 집계)";
+/// Internet peers per (alert kind, internal host) that get their own alert before a summary.
+const EXTERNAL_ALERT_PEERS: u32 = 20;
+
 /// Process points tracked across all devices (learned values, last value, states).
 pub const MAX_POINTS: usize = 100_000;
 /// Read requests waiting for their response.
@@ -346,6 +352,8 @@ pub struct Engine {
     external: FxHashMap<ExtKey, ExtConn>,
     /// Names learned for addresses that have no asset yet.
     pending_names: FxHashMap<u32, Vec<String>>,
+    /// Internet peers already alerted per (alert title, internal host).
+    external_alert_peers: FxHashMap<(Sym, u32), u32>,
     next_external_sweep: i64,
     /// New-point alerts per (client, server): (count in window, window start, individual alerts ever).
     new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64, u32)>,
@@ -410,6 +418,7 @@ impl Engine {
             internal_nets: Vec::new(),
             external: Default::default(),
             pending_names: Default::default(),
+            external_alert_peers: Default::default(),
             next_external_sweep: 0,
             new_point_alerts: Default::default(),
             conversations: Default::default(),
@@ -1006,12 +1015,11 @@ impl Engine {
         let from_inside = s == internal;
         let is_new = !self.external.contains_key(&key);
         if is_new {
-            if self.external.len() >= MAX_EXTERNAL {
-                self.external.retain(|_, c| now - c.last_seen < 3_600_000);
-            }
+            // Rules always run (alerts are budgeted per host); only storing the conversation is
+            // skipped while the table is full. Old entries are cleared by the periodic sweep.
             self.external_rules_new(&key, now);
             if self.external.len() >= MAX_EXTERNAL {
-                return; // rules were still applied; the conversation just is not kept
+                return;
             }
         }
         let conn = self.external.entry(key).or_insert_with(|| ExtConn { first_seen: now, ..Default::default() });
@@ -1055,8 +1063,36 @@ impl Engine {
         if let Some(org) = self.org_of(key.external) {
             details.push(("organization".into(), Value::from(org.name)));
         }
-        self.alert(severity, title, proto, op, src, Some(dst), now, "", details, None);
-        if let Some(alert) = self.alerts.get_mut(&AlertKey { title, src, dst: Some(dst) }) {
+        // The first EXTERNAL_ALERT_PEERS internet peers per internal host get their own alert; more
+        // (a scan, a spray from many sources) are folded into one summary listing the peers.
+        let peers = self.external_alert_peers.entry((title, key.internal)).or_insert(0);
+        let alert_key = if *peers < EXTERNAL_ALERT_PEERS
+            || self.alerts.contains_key(&AlertKey { title, src, dst: Some(dst) }) {
+            if !self.alerts.contains_key(&AlertKey { title, src, dst: Some(dst) }) {
+                *peers += 1;
+            }
+            self.alert(severity, title, proto, op, src, Some(dst), now, "", details, None);
+            AlertKey { title, src, dst: Some(dst) }
+        } else {
+            let summary_title = format!("{} (다수 주소)", self.syms.get(title));
+            let summary = self.syms.intern(&summary_title);
+            let internal = AssetKey::Ip(key.internal);
+            self.alert(severity, summary, proto, op, internal, None, now, "", details, None);
+            let k = AlertKey { title: summary, src: internal, dst: None };
+            if let Some(alert) = self.alerts.get_mut(&k) {
+                let peer = Value::from(decode::ip_string(key.external));
+                match alert.details.iter_mut().find(|(n, _)| n == "peers") {
+                    Some((_, Value::Array(list))) => {
+                        if !list.contains(&peer) && list.len() < SUMMARY_POINTS {
+                            list.push(peer);
+                        }
+                    }
+                    _ => alert.details.push(("peers".into(), Value::Array(vec![peer]))),
+                }
+            }
+            k
+        };
+        if let Some(alert) = self.alerts.get_mut(&alert_key) {
             alert.external = true;
         }
     }
@@ -1084,6 +1120,9 @@ impl Engine {
 
     /// Devices identified as OT only after their first internet conversation are caught here.
     fn sweep_external(&mut self, now: i64) {
+        if self.external.len() >= MAX_EXTERNAL * 9 / 10 {
+            self.external.retain(|_, c| now - c.last_seen < 3_600_000);
+        }
         let pending: Vec<ExtKey> = self.external.iter()
             .filter(|(k, c)| !k.inbound && !c.ot_checked && now - c.last_seen < 3_600_000)
             .map(|(k, _)| *k).collect();
@@ -1564,8 +1603,21 @@ impl Engine {
     fn alert(&mut self, severity: &'static str, title: Sym, protocol: Sym, operation: Sym, src: AssetKey,
              dst: Option<AssetKey>, now: i64, category: &'static str, details: Vec<(String, Value)>,
              baseline: Option<Item>) {
-        let key = AlertKey { title, src, dst };
+        let mut key = AlertKey { title, src, dst };
+        let mut details = details;
+        let overflow = !self.alerts.contains_key(&key) && self.alerts.len() >= MAX_ALERTS;
+        if overflow {
+            // The alert table is full: further new alerts are counted in one summary alert that
+            // names the latest one, so an attacker cannot grow memory (or hide) by creating more.
+            let last = vec![("last_title".to_string(), Value::from(self.syms.get(title))),
+                            ("last_src".to_string(), Value::from(src.to_string())),
+                            ("last_dst".to_string(), Value::from(dst.map(|d| d.to_string())))];
+            key = AlertKey { title: self.syms.intern(ALERT_OVERFLOW_TITLE), src: AssetKey::Ip(0), dst: None };
+            details = last;
+        }
+        let (severity, src, dst) = if overflow { ("high", key.src, key.dst) } else { (severity, src, dst) };
         let next_id = &mut self.next_alert_id;
+        let overflow_details = overflow.then(|| details.clone());
         let alert = self.alerts.entry(key).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
@@ -1574,6 +1626,9 @@ impl Engine {
         });
         let created = alert.count == 0;
         alert.count += 1;
+        if let Some(d) = overflow_details {
+            alert.details = d;
+        }
         alert.last_seen = alert.last_seen.max(now);
         let mut reopened = false;
         if alert.acknowledged && alert.last_seen == now {
@@ -2114,6 +2169,13 @@ impl Engine {
             self.alerts.insert(key, alert);
         }
         self.learning = self.baseline.mode == Mode::Learning;
+        self.generation += 1;
+    }
+
+    /// One-time data corrections for databases written by earlier versions. Run after the
+    /// internal-network settings are applied (they decide what counts as the internet), and only
+    /// once per database (the caller records that it ran).
+    pub fn run_migrations(&mut self) {
         self.forget_ephemeral_misidentification();
         self.acknowledge_p2p_inbound_alerts();
         self.generation += 1;

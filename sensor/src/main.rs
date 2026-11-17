@@ -465,6 +465,14 @@ fn serve() -> Result<(), String> {
         Err(e) => Some(e),
     };
     load_intel(&mut engine, &config)?;
+    // One-time corrections of data written by earlier versions (after the network settings above).
+    let marker = config.db_path.with_extension("migrated-v1");
+    if !marker.exists() {
+        engine.run_migrations();
+        if let Err(e) = std::fs::write(&marker, "ephemeral-port misidentification, P2P inbound alerts\n") {
+            eprintln!("warning: could not record migration ({}): {e}", marker.display());
+        }
+    }
     let engine = Arc::new(Mutex::new(engine));
     let env_str = |n: &str| env(n);
     let forwarder = siem::Forwarder::from_settings(env_str("NETEYE_SYSLOG").as_deref(),
