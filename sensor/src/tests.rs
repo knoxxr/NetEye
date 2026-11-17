@@ -1286,7 +1286,27 @@ fn hosts_misread_by_earlier_versions_are_reset_on_load() {
     e.restore(vec![asset("10.0.0.20", "CC-Link IE Field Basic station"), asset("10.0.1.6", "CC-Link IE Field Basic station"),
                    asset("8.8.8.8", "Unknown")],
               vec![link("10.0.0.20", "8.8.8.8"), link("10.0.1.5", "10.0.1.6")], Vec::new(), None, Vec::new());
+    assert_eq!(by_label(&snap(&mut e))["10.0.0.20"]["device_type"], "CC-Link IE Field Basic station",
+               "loading alone changes nothing");
+    e.run_migrations();
     let a = by_label(&snap(&mut e));
     assert_eq!(a["10.0.0.20"]["device_type"], "Unknown", "the PC that browses the internet is corrected");
     assert_eq!(a["10.0.1.6"]["device_type"], "CC-Link IE Field Basic station", "a real station is left alone");
+}
+
+#[test]
+fn inbound_sprays_from_many_addresses_fold_into_a_summary() {
+    let mut frames = Vec::new();
+    for i in 1..=30u8 {
+        let peer = format!("2.2.2.{i}");
+        frames.push(tcp_full(&peer, "10.0.0.30", 40000, 3389, &[], PLC_MAC, HMI_MAC, 0x02));
+        frames.push(tcp_full("10.0.0.30", &peer, 3389, 40000, &[], HMI_MAC, PLC_MAC, 0x12));
+    }
+    let s = run(&frames);
+    let alerts: Vec<&Value> = s["alerts"].as_array().unwrap().iter().filter(|a| a["source"] == "external").collect();
+    let individual = alerts.iter().filter(|a| a["title"] == "인터넷에서 내부 서비스로 접속").count();
+    let summary: Vec<&&Value> = alerts.iter().filter(|a| a["title"] == "인터넷에서 내부 서비스로 접속 (다수 주소)").collect();
+    assert_eq!((individual, summary.len()), (20, 1));
+    assert_eq!(summary[0]["count"], 10);
+    assert_eq!(summary[0]["details"]["peers"].as_array().unwrap().len(), 10);
 }
