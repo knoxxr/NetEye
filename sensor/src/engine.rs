@@ -140,6 +140,13 @@ pub struct ManualInfo {
     pub updated_at: String,
 }
 
+/// Process points tracked across all devices (learned values, last value, states).
+pub const MAX_POINTS: usize = 100_000;
+/// Read requests waiting for their response.
+const MAX_PENDING_READS: usize = 4096;
+/// Individual "unlearned address" alerts per client/server before they are summarised.
+const NEW_POINT_ALERTS: u32 = 20;
+
 pub const CRITICALITY: [&str; 5] = ["", "low", "medium", "high", "critical"];
 
 impl ManualInfo {
@@ -323,6 +330,8 @@ pub struct Engine {
     mac_ips: FxHashMap<u64, Vec<u32>>,
     /// DHCP names/OS for clients not yet seen with an address, applied when their MAC shows up.
     pending_hosts: FxHashMap<u64, osfp::HostInfo>,
+    /// New-point alerts raised per (client, server), to fold a write sweep into one alert.
+    new_point_alerts: FxHashMap<(AssetKey, AssetKey), u32>,
     conversations: FxHashMap<(AssetKey, AssetKey, &'static str), Sym>,
     next_alert_id: u64,
     dirty_assets: Vec<AssetKey>,
@@ -379,6 +388,7 @@ impl Engine {
             alerts: Default::default(),
             mac_ips: Default::default(),
             pending_hosts: Default::default(),
+            new_point_alerts: Default::default(),
             conversations: Default::default(),
             next_alert_id: 1,
             dirty_assets: Vec::new(),
@@ -442,8 +452,11 @@ impl Engine {
     /// Pair read requests with their responses and judge the values they carry.
     fn observe_reads(&mut self, client: AssetKey, server: AssetKey, proto: Sym, f: &mut Finding, now: i64) {
         if let (Some(true), Some((tx, items))) = (f.is_request, f.read_request.take()) {
-            if self.pending_reads.len() >= 4096 {
+            if self.pending_reads.len() >= MAX_PENDING_READS {
                 self.pending_reads.retain(|_, (ts, _)| now - *ts < 30_000); // unanswered requests
+                if self.pending_reads.len() >= MAX_PENDING_READS {
+                    self.pending_reads.clear(); // a flood of fresh requests: hard limit regardless of age
+                }
             }
             self.pending_reads.insert((client, server, proto, tx), (now, items));
         }
@@ -464,8 +477,12 @@ impl Engine {
                       operation: &str, category: &'static str, now: i64) {
         let learning = self.learning;
         for v in values {
+            // Once the table is full, addresses not seen before are neither named nor tracked:
+            // an address scan cannot grow memory (points, names, alerts) without bound.
+            let full = self.points.len() >= MAX_POINTS;
             let point = match self.point_syms.get(&v.point) {
                 Some(&sym) => sym,
+                None if full => continue,
                 None => {
                     if self.point_syms.len() >= 200_000 {
                         self.point_syms.clear(); // bound memory against address scans
@@ -476,6 +493,9 @@ impl Engine {
                 }
             };
             let key = PointKey { server, proto, point, measured: v.measured };
+            if full && !self.points.contains_key(&key) {
+                continue;
+            }
             let profile = self.points.entry(key).or_default();
             let anomaly = profile.observe_kind(v.value, v.discrete, learning, now, v.measured);
             if !profile.dirty {
@@ -495,8 +515,15 @@ impl Engine {
                     format!("{}: {name}", if measured { "측정 상태 미학습 값" } else { "학습되지 않은 상태 값" }),
                     vec![("value".into(), fmt(value)),
                          ("learned_values".into(), Value::Array(states.into_iter().map(fmt).collect()))]),
-                (PointAnomaly::NewPoint { value }, _) => ("medium", format!("학습되지 않은 주소에 쓰기: {name}"),
-                    vec![("value".into(), fmt(value))]),
+                (PointAnomaly::NewPoint { value }, _) => {
+                    // One alert per address for the first few, then a single summary per client/server
+                    // pair, so a write sweep cannot flood the alert list.
+                    let seen = self.new_point_alerts.entry((client, server)).or_insert(0);
+                    *seen += 1;
+                    let title = if *seen <= NEW_POINT_ALERTS { format!("학습되지 않은 주소에 쓰기: {name}") }
+                                else { "학습되지 않은 주소에 쓰기 (다수 주소)".to_string() };
+                    ("medium", title, vec![("value".into(), fmt(value)), ("point".into(), Value::from(name.clone()))])
+                }
             };
             let title_sym = self.syms.intern(&title);
             let op = self.syms.intern(operation);

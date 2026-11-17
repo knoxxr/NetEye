@@ -130,7 +130,7 @@ pub async fn login(State(s): State<Arc<AppState>>, Extension(ClientIp(ip)): Exte
         return error(StatusCode::BAD_REQUEST, "username and password required");
     };
     let username = req.username.trim().to_ascii_lowercase();
-    if let Some(remaining) = s.throttle.locked(&username) {
+    if let Some(remaining) = s.throttle.locked(&username, &ip) {
         s.audit(&username, &ip, "login", 429, "locked");
         return error(StatusCode::TOO_MANY_REQUESTS,
                      format!("로그인 시도가 너무 많습니다. {}초 후 다시 시도하세요", remaining.as_secs() + 1));
@@ -142,11 +142,11 @@ pub async fn login(State(s): State<Arc<AppState>>, Extension(ClientIp(ip)): Exte
         None => { auth::verify_dummy(&password); (false, None) }
     }).await.unwrap();
     let Some(user) = user.filter(|_| ok) else {
-        s.throttle.failure(&username);
+        s.throttle.failure(&username, &ip);
         s.audit(&username, &ip, "login", 401, "invalid credentials");
         return error(StatusCode::UNAUTHORIZED, "사용자 이름 또는 비밀번호가 올바르지 않습니다");
     };
-    s.throttle.success(&username);
+    s.throttle.success(&username, &ip);
     let role = Role::parse(&user.role).unwrap_or(Role::Viewer);
     let token = s.sessions.create(&user.username, role, user.must_change);
     s.audit(&user.username, &ip, "login", 200, "");

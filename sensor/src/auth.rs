@@ -155,20 +155,40 @@ fn expired(s: &Session, now: Instant) -> bool {
 
 // -------------------------------------------------------------- throttling
 #[derive(Default)]
+/// Failed sign-ins per (account, client address). Keying on the pair means someone guessing from
+/// one machine cannot lock the real user out from another (lockout as a denial of service); each
+/// source still gets only MAX_FAILURES guesses per LOCKOUT, on top of Argon2's cost per guess.
 pub struct Throttle {
-    map: Mutex<HashMap<String, (u32, Option<Instant>)>>,
+    map: Mutex<HashMap<(String, String), Attempts>>,
 }
 
+/// Consecutive failures and, once locked, until when.
+type Attempts = (u32, Option<Instant>);
+
+/// Upper bound on tracked (account, client) pairs.
+const THROTTLE_ENTRIES: usize = 10_000;
+
 impl Throttle {
-    /// Remaining lockout, if the account name is currently locked.
-    pub fn locked(&self, username: &str) -> Option<Duration> {
+    fn key(username: &str, client: &str) -> (String, String) {
+        (username.to_string(), client.to_string())
+    }
+    /// Remaining lockout, if this account is currently locked for this client.
+    pub fn locked(&self, username: &str, client: &str) -> Option<Duration> {
         let map = self.map.lock();
-        let until = map.get(username)?.1?;
+        let until = map.get(&Self::key(username, client))?.1?;
         until.checked_duration_since(Instant::now())
     }
-    pub fn failure(&self, username: &str) {
+    pub fn failure(&self, username: &str, client: &str) {
         let mut map = self.map.lock();
-        let entry = map.entry(username.to_string()).or_insert((0, None));
+        if map.len() >= THROTTLE_ENTRIES {
+            // Keep active lockouts; forget plain counters and expired locks.
+            let now = Instant::now();
+            map.retain(|_, (_, until)| until.is_some_and(|u| u > now));
+            if map.len() >= THROTTLE_ENTRIES {
+                map.clear();
+            }
+        }
+        let entry = map.entry(Self::key(username, client)).or_insert((0, None));
         if entry.1.is_some_and(|until| until <= Instant::now()) {
             *entry = (0, None); // previous lock elapsed: start counting again
         }
@@ -177,8 +197,8 @@ impl Throttle {
             entry.1 = Some(Instant::now() + LOCKOUT);
         }
     }
-    pub fn success(&self, username: &str) {
-        self.map.lock().remove(username);
+    pub fn success(&self, username: &str, client: &str) {
+        self.map.lock().remove(&Self::key(username, client));
     }
 }
 
@@ -259,14 +279,16 @@ mod tests {
     #[test]
     fn throttle_locks_after_repeated_failures() {
         let throttle = Throttle::default();
+        let (here, there) = ("10.0.0.5", "10.0.0.6");
         for _ in 0..MAX_FAILURES - 1 {
-            throttle.failure("admin");
+            throttle.failure("admin", here);
         }
-        assert!(throttle.locked("admin").is_none());
-        throttle.failure("admin");
-        assert!(throttle.locked("admin").is_some());
-        throttle.success("admin");
-        assert!(throttle.locked("admin").is_none());
+        assert!(throttle.locked("admin", here).is_none());
+        throttle.failure("admin", here);
+        assert!(throttle.locked("admin", here).is_some());
+        assert!(throttle.locked("admin", there).is_none(), "guessing elsewhere does not lock the real user out");
+        throttle.success("admin", here);
+        assert!(throttle.locked("admin", here).is_none());
     }
 
     #[test]
