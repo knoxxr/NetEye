@@ -147,6 +147,8 @@ pub struct ManualInfo {
 const MAX_ALERTS: usize = if cfg!(test) { 300 } else { 50_000 };
 const ALERT_OVERFLOW_TITLE: &str = "경고 수 한도 도달 (이후 새 경고는 이 항목에 집계)";
 const OVERFLOW_RECENT: usize = 50;
+/// SIEM events per summary/overflow alert between two drains of the queue (the rest are counted).
+const FOLD_EVENTS_PER_KEY: u32 = 100;
 const EXTERNAL_BUDGET_WINDOW_MS: i64 = 3_600_000;
 /// Internet peers per (alert kind, internal host) that get their own alert before a summary.
 const EXTERNAL_ALERT_PEERS: u32 = 20;
@@ -388,6 +390,8 @@ pub struct Engine {
     /// SIEM events waiting for the forwarder: alert, reopened, and for folded alerts / new summary
     /// peers the specific entry (so each one is forwarded with its own content).
     events: Vec<(AlertKey, bool, Option<Value>)>,
+    /// Per summary/overflow alert since the last drain: (fold events queued, fold events dropped).
+    fold_counts: FxHashMap<AlertKey, (u32, u32)>,
     /// After an eviction attempt that freed nothing, the next one waits until this time (or an
     /// acknowledgement), so a full table is not rescanned for every new alert.
     alert_room_retry_at: i64,
@@ -452,6 +456,7 @@ impl Engine {
             next_silence_check: 0,
             events: Vec::new(),
             alert_room_retry_at: 0,
+            fold_counts: Default::default(),
             points: Default::default(),
             dirty_points: Default::default(),
             point_syms: Default::default(),
@@ -1733,9 +1738,22 @@ impl Engine {
 
     /// Queue a SIEM event for one folded alert or one new summary peer, carrying that entry. Folds
     /// use at most 90% of the queue, so room always remains for new and reopened alerts.
+    ///
+    /// Fairness between alerts: the first fold of each alert per drain is always queued; after
+    /// that each alert gets at most FOLD_EVENTS_PER_KEY per drain, and what is dropped is counted
+    /// and reported on its last queued event. One flooded summary cannot crowd out the others.
     fn queue_fold_event(&mut self, key: AlertKey, entry: Value) {
-        if self.emit_events && self.events.len() < 90_000 {
+        if !self.emit_events {
+            return;
+        }
+        let counts = self.fold_counts.entry(key).or_insert((0, 0));
+        let first = counts.0 == 0;
+        if (first && self.events.len() < 100_000)
+            || (counts.0 < FOLD_EVENTS_PER_KEY && self.events.len() < 90_000) {
+            counts.0 += 1;
             self.events.push((key, false, Some(entry)));
+        } else {
+            counts.1 += 1;
         }
     }
 
@@ -2345,8 +2363,21 @@ impl Engine {
     pub fn take_events(&mut self) -> Vec<crate::siem::SiemEvent> {
         let queued = std::mem::take(&mut self.events);
         self.alert_room_retry_at = 0; // queued alerts were the ones that could not be evicted
+        // Fold events that did not fit are reported on the last queued event of their alert.
+        let dropped: FxHashMap<AlertKey, u32> = std::mem::take(&mut self.fold_counts).into_iter()
+            .filter(|(_, (_, d))| *d > 0).map(|(k, (_, d))| (k, d)).collect();
+        let mut last_of: FxHashMap<AlertKey, usize> = FxHashMap::default();
+        for (i, (k, _, folded)) in queued.iter().enumerate() {
+            if folded.is_some() {
+                last_of.insert(*k, i);
+            }
+        }
         let mut out = Vec::with_capacity(queued.len());
-        for (key, reopened, folded) in queued {
+        for (index, (key, reopened, mut folded)) in queued.into_iter().enumerate() {
+            if let (Some(n), Some(Value::Object(map))) = (dropped.get(&key), folded.as_mut())
+                && last_of.get(&key) == Some(&index) {
+                    map.insert("dropped_events".into(), Value::from(*n));
+                }
             let Some(a) = self.alerts.get(&key) else { continue };
             let title = self.syms.get(a.key.title);
             let operation = self.syms.get(a.operation);
