@@ -357,7 +357,7 @@ pub struct Engine {
     /// Names learned for addresses that have no asset yet.
     pending_names: FxHashMap<u32, Vec<String>>,
     /// Internet peers alerted per (alert title, internal host) in the current hour: (count, window start).
-    external_alert_peers: FxHashMap<(Sym, u32), (u32, i64)>,
+    external_alert_peers: FxHashMap<(Sym, u32, bool), (u32, i64)>,
     next_external_sweep: i64,
     /// New-point alerts per (client, server): (count in window, window start, individual alerts ever).
     new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64, u32)>,
@@ -385,9 +385,9 @@ pub struct Engine {
     next_silence_check: i64,
     /// When true, new and re-opened alerts are queued for SIEM forwarding.
     pub emit_events: bool,
-    events: Vec<(AlertKey, bool)>,
-    /// Summary/overflow alerts already waiting in `events` (repeat folds share one entry).
-    queued_folds: FxHashSet<AlertKey>,
+    /// SIEM events waiting for the forwarder: alert, reopened, and for folded alerts / new summary
+    /// peers the specific entry (so each one is forwarded with its own content).
+    events: Vec<(AlertKey, bool, Option<Value>)>,
     /// After an eviction attempt that freed nothing, the next one waits until this time (or an
     /// acknowledgement), so a full table is not rescanned for every new alert.
     alert_room_retry_at: i64,
@@ -451,7 +451,6 @@ impl Engine {
             clock: 0,
             next_silence_check: 0,
             events: Vec::new(),
-            queued_folds: Default::default(),
             alert_room_retry_at: 0,
             points: Default::default(),
             dirty_points: Default::default(),
@@ -1080,7 +1079,9 @@ impl Engine {
         if self.external_alert_peers.len() >= 100_000 {
             self.external_alert_peers.clear();
         }
-        let budget = self.external_alert_peers.entry((title, key.internal)).or_insert((0, now));
+        // Budgets are kept per direction, so (possibly spoofed) inbound traffic cannot use up the
+        // budget that covers connections the internal host itself opens.
+        let budget = self.external_alert_peers.entry((title, key.internal, key.inbound)).or_insert((0, now));
         if now - budget.1 > EXTERNAL_BUDGET_WINDOW_MS {
             *budget = (0, now);
         }
@@ -1097,6 +1098,8 @@ impl Engine {
             let summary_title = format!("{} (다수 주소)", self.syms.get(title));
             let summary = self.syms.intern(&summary_title);
             let internal = AssetKey::Ip(key.internal);
+            let mut entry: serde_json::Map<String, Value> = details.iter().cloned().collect();
+            entry.insert("peer".into(), Value::from(decode::ip_string(key.external)));
             self.alert(severity, summary, proto, op, internal, None, now, "", details, None);
             let k = AlertKey { title: summary, src: internal, dst: None };
             let mut added = false;
@@ -1119,9 +1122,9 @@ impl Engine {
                     }
                 }
             }
-            // New peers in a summary are forwarded to the SIEM as well (coalesced per drain).
+            // Each new peer in a summary is forwarded to the SIEM with its own address and details.
             if added {
-                self.queue_fold_event(k);
+                self.queue_fold_event(k, Value::Object(entry));
             }
             k
         };
@@ -1660,7 +1663,7 @@ impl Engine {
         });
         let created = alert.count == 0;
         alert.count += 1;
-        if let Some(entry) = folded {
+        if let Some(entry) = folded.clone() {
             // The most recent folded alerts stay readable in the summary.
             if !alert.details.iter().any(|(k, _)| k == "recent") {
                 alert.details = vec![("recent".into(), Value::Array(Vec::new()))];
@@ -1684,11 +1687,11 @@ impl Engine {
         }
         // Bounded so a stalled forwarder can never exhaust memory.
         if self.emit_events && (created || reopened) && self.events.len() < 100_000 {
-            self.events.push((key, reopened));
+            self.events.push((key, reopened, None));
         }
-        // Folded alerts are forwarded too (coalesced per drain; the summary lists the recent ones).
-        if overflow && !created && !reopened {
-            self.queue_fold_event(key);
+        // Every folded alert is forwarded with its own content.
+        if let Some(entry) = folded.filter(|_| !created && !reopened) {
+            self.queue_fold_event(key, entry);
         }
     }
 
@@ -1700,7 +1703,7 @@ impl Engine {
             return false;
         }
         // Never evict what the store or the SIEM has not received yet.
-        let queued: FxHashSet<AlertKey> = self.events.iter().map(|(k, _)| *k).collect();
+        let queued: FxHashSet<AlertKey> = self.events.iter().map(|(k, _, _)| *k).collect();
         let mut candidates: Vec<(bool, i64, AlertKey)> = self.alerts.iter()
             .filter(|(k, a)| (a.acknowledged || matches!(a.severity, "low" | "info")) && !a.dirty && !queued.contains(k))
             .map(|(k, a)| (!a.acknowledged, a.last_seen, *k)).collect();
@@ -1728,11 +1731,11 @@ impl Engine {
         true
     }
 
-    /// Queue a SIEM event for a summary/overflow alert: one entry per alert until the forwarder
-    /// drains the queue, within a share that leaves room for new and reopened alerts.
-    fn queue_fold_event(&mut self, key: AlertKey) {
-        if self.emit_events && self.events.len() < 90_000 && self.queued_folds.insert(key) {
-            self.events.push((key, false));
+    /// Queue a SIEM event for one folded alert or one new summary peer, carrying that entry. Folds
+    /// use at most 90% of the queue, so room always remains for new and reopened alerts.
+    fn queue_fold_event(&mut self, key: AlertKey, entry: Value) {
+        if self.emit_events && self.events.len() < 90_000 {
+            self.events.push((key, false, Some(entry)));
         }
     }
 
@@ -2039,6 +2042,7 @@ impl Engine {
     // ----------------------------------------------------------- persistence
     /// Drain dirty records into serialized rows for the store.
     pub fn take_changes(&mut self) -> Changes {
+        self.alert_room_retry_at = 0; // dirty alerts become evictable once stored
         let mut changes = Changes::default();
         for key in std::mem::take(&mut self.dirty_assets) {
             if let Some(a) = self.assets.get(&key)
@@ -2340,9 +2344,9 @@ impl Engine {
     /// Drain queued alert notifications into SIEM events, with asset context.
     pub fn take_events(&mut self) -> Vec<crate::siem::SiemEvent> {
         let queued = std::mem::take(&mut self.events);
-        self.queued_folds.clear();
+        self.alert_room_retry_at = 0; // queued alerts were the ones that could not be evicted
         let mut out = Vec::with_capacity(queued.len());
-        for (key, reopened) in queued {
+        for (key, reopened, folded) in queued {
             let Some(a) = self.alerts.get(&key) else { continue };
             let title = self.syms.get(a.key.title);
             let operation = self.syms.get(a.operation);
@@ -2396,8 +2400,11 @@ impl Engine {
                 dst_device: self.device_summary(a.dst),
                 user: None,
                 outcome: None,
-                details: if a.details.is_empty() { Value::Null }
-                         else { Value::Object(a.details.iter().cloned().collect()) },
+                details: match folded {
+                    Some(entry) => entry,
+                    None if a.details.is_empty() => Value::Null,
+                    None => Value::Object(a.details.iter().cloned().collect()),
+                },
             });
         }
         out

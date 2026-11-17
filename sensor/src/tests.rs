@@ -1312,6 +1312,23 @@ fn inbound_sprays_from_many_addresses_fold_into_a_summary() {
 }
 
 #[test]
+fn each_new_summary_peer_reaches_the_siem_with_its_address() {
+    let mut e = Engine::new();
+    e.emit_events = true;
+    let mut frames = Vec::new();
+    for i in 1..=25u8 {
+        let peer = format!("2.2.3.{i}");
+        frames.push(tcp_full(&peer, "10.0.0.30", 40000, 3389, &[], PLC_MAC, HMI_MAC, 0x02));
+        frames.push(tcp_full("10.0.0.30", &peer, 3389, 40000, &[], HMI_MAC, PLC_MAC, 0x12));
+    }
+    feed(&mut e, &frames, T0);
+    let peers: Vec<String> = e.take_events().iter().filter(|ev| ev.name.ends_with("(다수 주소)"))
+        .filter_map(|ev| ev.details["peer"].as_str().map(str::to_string)).collect();
+    assert_eq!(peers.len(), 5, "{peers:?}");
+    assert!(peers.contains(&"2.2.3.25".to_string()));
+}
+
+#[test]
 fn a_full_alert_table_evicts_old_noise_and_folds_the_rest() {
     let mut e = Engine::new();
     e.emit_events = true;
@@ -1329,9 +1346,11 @@ fn a_full_alert_table_evicts_old_noise_and_folds_the_rest() {
     let overflow = alerts.iter().find(|a| a["title"].as_str().unwrap().starts_with("경고 수 한도 도달")).expect("summary");
     assert_eq!(overflow["details"]["recent"].as_array().unwrap().len(), 50, "most recent kept");
     assert!(overflow["count"].as_u64().unwrap() > 50);
-    // Repeated folds share one queued SIEM event per drain (the summary lists the recent ones).
-    let forwarded = e.take_events().iter().filter(|ev| ev.name.starts_with("경고 수 한도")).count();
-    assert!((1..=2).contains(&forwarded), "{forwarded}");
+    // Every folded alert is forwarded on its own, carrying what was folded.
+    let events = e.take_events();
+    let folded: Vec<_> = events.iter().filter(|ev| ev.name.starts_with("경고 수 한도")).collect();
+    assert!(folded.len() as u64 >= overflow["count"].as_u64().unwrap() - 1, "{} folded events", folded.len());
+    assert!(folded.iter().skip(1).all(|ev| ev.details["src"].as_str().is_some_and(|s| s.starts_with("10.1."))));
 
     // Acknowledged alerts make room again for new ones.
     let ids: Vec<u64> = alerts.iter().filter(|a| !a["title"].as_str().unwrap().starts_with("경고 수"))
