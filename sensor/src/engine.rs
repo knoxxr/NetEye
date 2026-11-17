@@ -147,6 +147,7 @@ const MAX_PENDING_READS: usize = 4096;
 /// Individual "unlearned address" alerts per client/server and window before they are summarised.
 const NEW_POINT_ALERTS: u32 = 20;
 const NEW_POINT_WINDOW_MS: i64 = 10 * 60 * 1000;
+const NEW_POINT_ALERTS_EVER: u32 = 200;
 /// Addresses listed by name in a summary alert (the rest are counted).
 const SUMMARY_POINTS: usize = 200;
 
@@ -333,8 +334,8 @@ pub struct Engine {
     mac_ips: FxHashMap<u64, Vec<u32>>,
     /// DHCP names/OS for clients not yet seen with an address, applied when their MAC shows up.
     pending_hosts: FxHashMap<u64, osfp::HostInfo>,
-    /// New-point alerts per (client, server) in the current window: (count, window start).
-    new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64)>,
+    /// New-point alerts per (client, server): (count in window, window start, individual alerts ever).
+    new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64, u32)>,
     conversations: FxHashMap<(AssetKey, AssetKey, &'static str), Sym>,
     next_alert_id: u64,
     dirty_assets: Vec<AssetKey>,
@@ -555,12 +556,15 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn new_point_alert(&mut self, client: AssetKey, server: AssetKey, proto: Sym, operation: &str,
                        category: &'static str, name: String, value: Value, now: i64, force_summary: bool) {
-        let window = self.new_point_alerts.entry((client, server)).or_insert((0, now));
+        let window = self.new_point_alerts.entry((client, server)).or_insert((0, now, 0));
         if now - window.1 > NEW_POINT_WINDOW_MS {
-            *window = (0, now);
+            (window.0, window.1) = (0, now);
         }
         window.0 += 1;
-        if !force_summary && window.0 <= NEW_POINT_ALERTS {
+        // Individual alerts per pair are limited per window and for good, so even a slow sweep
+        // over months cannot grow the alert list (or the name table) without bound.
+        if !force_summary && window.0 <= NEW_POINT_ALERTS && window.2 < NEW_POINT_ALERTS_EVER {
+            window.2 += 1;
             let details = vec![("value".into(), value), ("point".into(), Value::from(name.clone()))];
             self.point_alert("medium", &format!("학습되지 않은 주소에 쓰기: {name}"), details, proto, operation,
                              category, client, server, now);

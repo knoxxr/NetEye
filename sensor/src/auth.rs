@@ -161,8 +161,9 @@ fn expired(s: &Session, now: Instant) -> bool {
 ///   under guard for LOCKOUT, during which only clients that signed in to it before may try.
 ///
 /// Distributed guessing is capped by the account budget, while the real user (on a known machine)
-/// is never locked out by someone else's guesses. Unknown user names are not tracked at all, so
-/// made-up names cannot fill the tables; active locks are never evicted.
+/// is never locked out by someone else's guesses. Unknown names are throttled exactly like real
+/// ones, so lockouts do not reveal which accounts exist; when the tables are full, entries for
+/// unknown names are evicted first and active locks never are.
 pub struct Throttle {
     state: Mutex<ThrottleState>,
 }
@@ -171,8 +172,8 @@ pub struct Throttle {
 struct ThrottleState {
     /// (account, client) -> (consecutive failures, locked until)
     pairs: HashMap<(String, String), (u32, Option<Instant>)>,
-    /// account -> (failures in window, window start, guarded until)
-    accounts: HashMap<String, (u32, Instant, Option<Instant>)>,
+    /// account -> (failures in window, window start, guarded until, account exists)
+    accounts: HashMap<String, (u32, Instant, Option<Instant>, bool)>,
     /// account -> clients that signed in successfully (most recent last)
     trusted: HashMap<String, Vec<String>>,
 }
@@ -180,6 +181,7 @@ struct ThrottleState {
 const ACCOUNT_FAILURES: u32 = 20;
 const ACCOUNT_WINDOW: Duration = Duration::from_secs(15 * 60);
 const THROTTLE_PAIRS: usize = 10_000;
+const THROTTLE_ACCOUNTS: usize = 10_000;
 const TRUSTED_PER_ACCOUNT: usize = 16;
 
 /// IPv6 clients are counted per /64, the block one subscriber usually controls.
@@ -208,22 +210,27 @@ impl Throttle {
         pair.max(guard)
     }
 
-    /// A failed sign-in. `exists`: whether the account exists (unknown names are not tracked).
+    /// A failed sign-in. `exists` only decides what may be evicted first when tables are full; the
+    /// visible behaviour is the same for real and unknown names.
     pub fn failure(&self, username: &str, client: &str, exists: bool) {
-        if !exists {
-            return;
-        }
         let client = client_bucket(client);
         let mut st = self.state.lock();
         let now = Instant::now();
 
-        let account = st.accounts.entry(username.to_string()).or_insert((0, now, None));
-        if now.duration_since(account.1) > ACCOUNT_WINDOW {
-            *account = (0, now, account.2.filter(|until| *until > now));
+        if !st.accounts.contains_key(username) && st.accounts.len() >= THROTTLE_ACCOUNTS {
+            // Real accounts and active guards stay; counters for made-up names go.
+            st.accounts.retain(|_, a| a.3 || a.2.is_some_and(|until| until > now));
         }
-        account.0 += 1;
-        if account.0 >= ACCOUNT_FAILURES {
-            account.2 = Some(now + LOCKOUT);
+        if st.accounts.contains_key(username) || st.accounts.len() < THROTTLE_ACCOUNTS {
+            let account = st.accounts.entry(username.to_string()).or_insert((0, now, None, exists));
+            account.3 |= exists;
+            if now.duration_since(account.1) > ACCOUNT_WINDOW {
+                *account = (0, now, account.2.filter(|until| *until > now), account.3);
+            }
+            account.0 += 1;
+            if account.0 >= ACCOUNT_FAILURES {
+                account.2 = Some(now + LOCKOUT);
+            }
         }
 
         let key = (username.to_string(), client);
@@ -355,11 +362,12 @@ mod tests {
         assert!(throttle.locked("admin", "198.51.100.7").is_some());
         assert!(throttle.locked("admin", there).is_none());
 
-        // Made-up names are not tracked; IPv6 counts per /64.
-        for i in 0..10 {
-            throttle.failure(&format!("nobody{i}"), here, false);
+        // Made-up names lock out on the same schedule, so lockouts reveal nothing; IPv6 counts per /64.
+        for _ in 0..MAX_FAILURES {
+            throttle.failure("nobody", "10.0.0.9", false);
+            throttle.failure("admin2", "10.0.0.9", true);
         }
-        assert!(throttle.locked("nobody0", here).is_none());
+        assert_eq!(throttle.locked("nobody", "10.0.0.9").is_some(), throttle.locked("admin2", "10.0.0.9").is_some());
         assert_eq!(client_bucket("2001:db8:1:2:aaaa::1"), client_bucket("2001:db8:1:2:bbbb::9"));
         assert_eq!(client_bucket("10.0.0.5"), "10.0.0.5");
     }
