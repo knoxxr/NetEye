@@ -692,8 +692,43 @@ function renderSiem(info) {
   }).join("");
 }
 
+let captureChoicesLoaded = false;
+
+async function loadCaptureSettings() {
+  const response = await api("/api/sensor");
+  if (!response.ok) return;
+  const data = await response.json();
+  const select = document.getElementById("capture-interface-select");
+  const current = data.sensor && data.sensor.interface;
+  const options = [`<option value="">수집 안 함 (PCAP 분석만)</option>`].concat(data.interfaces.map((d) =>
+    `<option value="${escapeHtml(d.name)}" ${d.name === current ? "selected" : ""}>${escapeHtml(d.description || d.name)}</option>`));
+  if (!captureChoicesLoaded || !select.matches(":focus")) {
+    select.innerHTML = options.join("");
+    captureChoicesLoaded = true;
+  }
+  const status = document.getElementById("capture-form-status");
+  status.textContent = data.error ? `수집 드라이버: ${data.error}`
+    : `${data.sensor.enabled ? "수집 중" : current ? "시작 중 또는 오류" : "수집 꺼짐"}${data.sensor.error ? ` · ${data.sensor.error}` : ""}`
+      + (data.config_file ? ` · 설정 파일 ${data.config_file}` : "");
+  status.className = `import-status ${data.error || data.sensor.error ? "error" : ""}`;
+}
+
+document.getElementById("capture-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const select = document.getElementById("capture-interface-select");
+  const response = await api("/api/sensor/capture", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interface: select.value || null }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) alert(data.detail || `적용 실패 (${response.status})`);
+  else if (data.warning) alert(data.warning);
+  setTimeout(loadCaptureSettings, 1500);
+});
+
 async function loadAdmin() {
   if (!can("admin")) return;
+  loadCaptureSettings();
   const [users, audit, integrations] = await Promise.all([api("/api/users"), api("/api/audit?limit=100"), api("/api/integrations")]);
   if (users.ok) renderUsers(await users.json());
   if (audit.ok) renderAudit(await audit.json());

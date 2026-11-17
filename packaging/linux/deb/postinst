@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+case "$1" in
+    configure)
+        . /usr/share/neteye/setup-common.sh
+        neteye_prepare
+        if [ -z "$2" ] && command -v curl >/dev/null; then
+            # First install: fresh IP-to-organisation data and threat list (ignored when offline).
+            /opt/neteye/update-intel.sh >/dev/null 2>&1 || true
+        fi
+        fresh=""
+        [ -f /var/lib/neteye/neteye.bdb ] || fresh=wait
+        neteye_start
+        neteye_show_password $fresh
+        if ! grep -q '^NETEYE_INTERFACE=..*' /etc/neteye/neteye.conf; then
+            echo " 수집 랜카드: 대시보드 > 패킷 수집 설정에서 고르세요."
+        fi
+        ;;
+esac
+exit 0

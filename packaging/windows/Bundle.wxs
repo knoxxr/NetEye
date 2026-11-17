@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NetEye-Setup.exe: installs everything NetEye needs in one go.
+    1. Npcap (packet capture driver) - only when it is not installed yet. Npcap's free edition may not
+       be redistributed, so it is not packed in here: the official installer is downloaded from
+       npcap.com at install time (pinned version, SHA-512 checked) and shown to the user, who accepts
+       its licence. Without it NetEye still analyses PCAP files.
+    2. NetEye.msi (sensor, service, dashboard, data).
+  Built by tools/package.py (variables: Version, MsiPath, NpcapUrl, NpcapHash, NpcapSize).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="NetEye OT Sensor" Version="$(Version)" Manufacturer="NetEye"
+          UpgradeCode="A43C9E1B-5D2F-4B7A-8C60-1E9F3D2B7A55" Compressed="yes">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkSidebarLicense" ShowVersion="yes"
+          LicenseUrl="https://npcap.com/oem/redist.html" SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+
+    <util:RegistrySearch Id="NpcapSearch" Root="HKLM" Key="SOFTWARE\Npcap" Result="exists"
+                         Variable="NpcapInstalled" Bitness="always32" />
+
+    <Chain>
+      <ExePackage Id="Npcap" DisplayName="Npcap (패킷 수집 드라이버)" Vital="no" Permanent="yes"
+                  PerMachine="yes" DetectCondition="NpcapInstalled">
+        <ExePackagePayload Name="npcap-installer.exe" DownloadUrl="$(NpcapUrl)" Hash="$(NpcapHash)"
+                           Size="$(NpcapSize)" ProductName="Npcap" Description="Npcap packet capture driver" />
+      </ExePackage>
+      <MsiPackage Id="NetEye" SourceFile="$(MsiPath)" Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

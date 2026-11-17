@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NetEye.msi: the sensor, its database engine, the dashboard and offline data, installed as the
+  "NetEye" Windows service (WinSW wrapper, automatic start, restart on failure).
+    Program files : %ProgramFiles%\NetEye
+    Data/settings : %ProgramData%\NetEye   (SYSTEM and Administrators only: it holds the database and
+                                           the initial administrator password)
+  Built by tools/package.py (variables: Version, Stage).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="NetEye OT Sensor" Manufacturer="NetEye" Version="$(Version)"
+           UpgradeCode="6E1B7C2A-3F4D-4E6B-9A51-0C2D7E8F9A10" Scope="perMachine" Compressed="yes"
+           Language="1042" Codepage="949">
+    <SummaryInformation Description="NetEye passive OT/ICS network monitoring sensor" Codepage="949" />
+    <MajorUpgrade DowngradeErrorMessage="이미 더 새로운 NetEye가 설치되어 있습니다." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Property Id="ARPURLINFOABOUT" Value="http://127.0.0.1:8000/" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NetEye">
+        <Directory Id="FrontendDir" Name="frontend" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DataDir" Name="NetEye">
+        <Directory Id="LogDir" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MenuDir" Name="NetEye" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Program" Directory="INSTALLFOLDER">
+      <Component>
+        <File Source="$(Stage)\neteye.exe" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Source="$(Stage)\bangdb.exe" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Source="$(Stage)\update-intel.ps1" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Source="$(Stage)\THIRD-PARTY.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="ServiceComponent">
+        <File Id="ServiceExe" Source="$(Stage)\neteye-service.exe" KeyPath="yes" />
+        <File Source="$(Stage)\neteye-service.xml" />
+        <ServiceInstall Name="NetEye" DisplayName="NetEye OT Sensor"
+                        Description="NetEye passive OT/ICS network monitoring sensor"
+                        Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes" />
+        <ServiceControl Id="NetEyeControl" Name="NetEye" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Frontend" Directory="FrontendDir">
+      <Files Include="$(Stage)\frontend\**" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="Data" Directory="DataDir">
+      <!-- The data folder is closed to ordinary users: database, settings, initial password. -->
+      <Component Id="DataDirAcl" Guid="5B0E5C4F-7A3E-4C55-8D0B-6C1A2F3E4D51">
+        <CreateFolder>
+          <!-- SDDL with well-known SIDs (language independent): protected, SYSTEM and
+               Administrators full control, inherited by everything inside. -->
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM" Key="SOFTWARE\NetEye" Name="DataDir" Type="string" Value="[DataDir]" KeyPath="yes" />
+      </Component>
+      <Component Id="Settings" NeverOverwrite="yes" Permanent="yes">
+        <File Source="$(Stage)\neteye.conf" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Source="$(Stage)\data\vulndb.json" KeyPath="yes" />
+      </Component>
+      <Component>
+        <File Source="$(Stage)\data\ip2asn-v4.tsv.gz" KeyPath="yes" />
+      </Component>
+      <Component Id="LogDirComponent" Directory="LogDir" Guid="9C2E1D7A-0B4F-4E8C-A6D3-1F5B7C9E2A40">
+        <CreateFolder />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\NetEye" Name="LogDir" Type="string" Value="[LogDir]" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Shortcuts" Directory="MenuDir">
+      <Component Id="MenuShortcuts" Guid="2D7F4A61-8E3B-4C0A-9F15-7B6E2C4D8A33">
+        <util:InternetShortcut Id="DashboardLink" Name="NetEye 대시보드" Target="http://127.0.0.1:8000/" />
+        <!-- The password file is readable by administrators only, so it is opened elevated. -->
+        <Shortcut Id="PasswordShortcut" Name="NetEye 초기 관리자 비밀번호 보기"
+                  Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+                  Arguments="-NoProfile -WindowStyle Hidden -Command &quot;Start-Process notepad.exe -Verb RunAs -ArgumentList '[DataDir]initial-admin-password.txt'&quot;" />
+        <Shortcut Id="SettingsShortcut" Name="NetEye 설정 파일 편집"
+                  Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+                  Arguments="-NoProfile -WindowStyle Hidden -Command &quot;Start-Process notepad.exe -Verb RunAs -ArgumentList '[DataDir]neteye.conf'&quot;" />
+        <Shortcut Id="IntelShortcut" Name="NetEye 조직 DB·위협 목록 갱신"
+                  Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+                  Arguments="-NoProfile -Command &quot;Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -NoExit -Command &amp; { &amp; ''[INSTALLFOLDER]update-intel.ps1''; Restart-Service NetEye }'&quot;" />
+        <RemoveFolder Id="RemoveMenuDir" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\NetEye" Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Fresh IP-to-organisation data and threat list at install time (ignored when offline). -->
+    <CustomAction Id="UpdateIntel" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="no" Return="ignore"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]update-intel.ps1&quot;" />
+    <InstallExecuteSequence>
+      <Custom Action="UpdateIntel" Before="StartServices" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="NetEye" Level="1">
+      <ComponentGroupRef Id="Program" />
+      <ComponentGroupRef Id="Frontend" />
+      <ComponentGroupRef Id="Data" />
+      <ComponentGroupRef Id="Shortcuts" />
+    </Feature>
+  </Package>
+</Wix>

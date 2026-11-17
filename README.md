@@ -80,6 +80,59 @@ NetEye는 Nozomi Guardian, Claroty CTD와 같은 계열의 **수동형(passive) 
 DeviceNet과 기존 CC-Link 필드버스는 이더넷이 아니라 CAN·RS-485 위에서 동작하므로 스위치 미러 포트에 나타나지
 않습니다. 보려면 필드버스 탭이나 게이트웨이가 필요하고, 상위의 EtherNet/IP·CIP 트래픽으로 간접 관찰할 수 있습니다.
 
+## 설치 (설치 파일)
+
+### Windows (10/11, Server 2016 이상, 64비트)
+
+`NetEye-Setup-<버전>.exe`를 관리자로 실행합니다.
+
+1. **Npcap(패킷 수집 드라이버)**: 설치되어 있지 않으면 npcap.com에서 공식 설치 파일(버전 고정, SHA-512 확인)을 받아
+   실행합니다. Npcap 무료판은 다른 설치 파일에 넣어 배포할 수 없어(OEM 라이선스 필요) 설치 시점에 내려받으며, 사용자가
+   직접 라이선스에 동의합니다. 인터넷이 없으면 이 단계는 건너뛰고(PCAP 분석은 가능) 나중에 Npcap을 따로 설치하면 됩니다.
+2. **NetEye**: `C:\Program Files\NetEye`에 설치되고 **NetEye 윈도우 서비스**(자동 시작, 실패 시 재시작)로 등록됩니다.
+   데이터·설정은 `C:\ProgramData\NetEye`에 있으며 SYSTEM과 Administrators만 접근할 수 있습니다.
+3. 시작 메뉴 **NetEye** 폴더: 대시보드 열기(http://127.0.0.1:8000), **초기 관리자 비밀번호 보기**, 설정 파일 편집,
+   조직 DB·위협 목록 갱신.
+4. 대시보드에 로그인한 뒤 **패킷 수집 설정**에서 미러링 포트에 연결된 랜카드를 고릅니다.
+
+`NetEye-<버전>.msi`만 따로 설치할 수도 있습니다(Npcap은 직접 설치). 서비스 관리: `Restart-Service NetEye`,
+로그: `C:\ProgramData\NetEye\logs`.
+
+### Linux (x86-64, glibc 2.17 이상: Ubuntu, Debian, RHEL/Rocky/Alma, SUSE)
+
+```bash
+# Debian / Ubuntu: libpcap까지 의존성으로 함께 설치
+sudo apt install ./neteye_<버전>_amd64.deb
+
+# 그 밖의 배포판 (libpcap은 dnf/yum/zypper로 자동 설치)
+tar xzf neteye-<버전>-linux-x86_64.tar.gz && sudo ./neteye-<버전>-linux-x86_64/install.sh
+#   옵션: --interface eth1  --listen 0.0.0.0  --port 8000  -y (묻지 않음)  --no-intel
+```
+
+- 프로그램 `/opt/neteye`, 설정 `/etc/neteye/neteye.conf`, 데이터 `/var/lib/neteye`.
+- **neteye systemd 서비스**: root가 아닌 전용 계정 `neteye`로 실행되며 패킷 수집에 필요한 권한
+  (CAP_NET_RAW, CAP_NET_ADMIN)만 받습니다. 설치가 끝나면 초기 관리자 비밀번호를 화면에 보여 줍니다.
+- 제거: `sudo apt remove neteye`(데이터 유지) / `sudo apt purge neteye`(모두 삭제), tar 설치는
+  `sudo /opt/neteye/uninstall.sh [--purge]`.
+- 조직 DB·위협 목록 갱신: `sudo /opt/neteye/update-intel.sh && sudo systemctl restart neteye` (cron 등록 권장).
+
+### 설정 파일
+
+설치판은 환경 변수 대신 설정 파일(`KEY=VALUE`, `${ProgramData}` 같은 변수 사용 가능)을 읽습니다. 찾는 순서:
+`NETEYE_CONFIG` → 실행 파일 옆 `neteye.conf` → `/etc/neteye/neteye.conf` 또는 `%ProgramData%\NetEye\neteye.conf`.
+이미 설정된 환경 변수가 파일보다 우선합니다. `neteye config`로 사용 중인 파일을 확인합니다.
+
+### 설치 파일 만들기
+
+```powershell
+python tools/package.py windows   # dist/NetEye-<버전>.msi, dist/NetEye-Setup-<버전>.exe  (Rust, Go, WiX 5)
+python tools/package.py linux     # dist/neteye_<버전>_amd64.deb, dist/neteye-<버전>-linux-x86_64.tar.gz
+                                  #   (rust target x86_64-unknown-linux-gnu, cargo-zigbuild, pip ziglang, Go)
+```
+
+설치판에는 오프라인으로도 바로 쓰도록 `data/vulndb.json`과 `data/ip2asn-v4.tsv.gz`가 들어갑니다. 서비스 래퍼로 WinSW
+(MIT)를 쓰며, 내려받는 구성 요소(WinSW, Npcap)는 해시로 고정되어 있습니다. 구성 요소 라이선스는 `packaging/THIRD-PARTY.txt`.
+
 ## 빌드와 실행
 
 Rust 1.85 이상과 Go 1.22 이상이 필요합니다(Go는 BangDB 빌드용). C 컴파일러와 캡처 SDK는 필요 없습니다.
@@ -466,7 +519,7 @@ REST/WebSocket API와 대시보드는 이전과 같습니다. Python 버전을 �
 ## 검증
 
 ```powershell
-cd sensor; cargo test --release                       # 테스트 83개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
+cd sensor; cargo test --release                       # 테스트 84개: 동작, 요청 검사, 계정, BangDB 저장, SIEM, 통계·공정 값·측정값 이상 탐지
                                                       # (저장 테스트는 실제 인메모리 bangdb를 띄우므로 먼저 빌드 필요)
 python tools/differential.py <pcap 폴더> --vulndb vulndb.json   # Rust와 기준 엔진을 필드 단위로 비교
 ```

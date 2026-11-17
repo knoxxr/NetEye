@@ -1,0 +1,19 @@
+<!-- WinSW service definition: runs neteye.exe as the NetEye Windows service. -->
+<service>
+  <id>NetEye</id>
+  <name>NetEye OT Sensor</name>
+  <description>NetEye passive OT/ICS network monitoring sensor</description>
+  <executable>%BASE%\neteye.exe</executable>
+  <arguments>serve</arguments>
+  <env name="NETEYE_CONFIG" value="%ProgramData%\NetEye\neteye.conf"/>
+  <workingdirectory>%ProgramData%\NetEye</workingdirectory>
+  <logpath>%ProgramData%\NetEye\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>30 sec</stoptimeout>
+  <startmode>Automatic</startmode>
+</service>
