@@ -18,9 +18,9 @@ neteye_prepare() {
     fi
     install -d -m 0750 -o neteye -g neteye /var/lib/neteye
     install -d -m 0770 -o root -g neteye /etc/neteye
-    if [ ! -f /etc/neteye/neteye.conf ]; then
-        install -m 0660 -o root -g neteye /usr/share/neteye/neteye.conf /etc/neteye/neteye.conf
-    fi
+    # The service rewrites its settings file (dashboard capture choice), so the folder is writable
+    # by neteye: root only touches it as the service account, through a temp file and a rename.
+    neteye_as_service sh -c "[ -e /etc/neteye/neteye.conf ] || { cp /usr/share/neteye/neteye.conf /etc/neteye/.neteye.conf.new && chmod 0660 /etc/neteye/.neteye.conf.new && mv -f /etc/neteye/.neteye.conf.new /etc/neteye/neteye.conf; }"
     # Offline data shipped with the package; never replaces newer files (updated by update-intel).
     # Written as the service account: root never writes into the folder neteye controls.
     for f in vulndb.json ip2asn-v4.tsv.gz; do
@@ -30,12 +30,12 @@ neteye_prepare() {
     done
 }
 
-neteye_set() {  # neteye_set KEY VALUE: set one key in the settings file
-    if grep -q "^$1=" /etc/neteye/neteye.conf; then
-        sed -i "s|^$1=.*|$1=$2|" /etc/neteye/neteye.conf
-    else
-        printf '%s=%s\n' "$1" "$2" >> /etc/neteye/neteye.conf
-    fi
+neteye_set() {  # neteye_set KEY VALUE: set one key in the settings file (as the service account)
+    case "$2" in *[!A-Za-z0-9._:/{}\ -]*) echo "잘못된 값: $2" >&2; return 1 ;; esac
+    neteye_as_service sh -c '
+        f=/etc/neteye/neteye.conf; t=/etc/neteye/.neteye.conf.new
+        { grep -v "^$1=" "$f" 2>/dev/null; printf "%s=%s\n" "$1" "$2"; } > "$t" && chmod 0660 "$t" && mv -f "$t" "$f"
+    ' neteye_set "$1" "$2"
 }
 
 neteye_start() {

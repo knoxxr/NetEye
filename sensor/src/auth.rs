@@ -172,6 +172,8 @@ pub struct Throttle {
 struct ThrottleState {
     pairs: HashMap<(String, String), Count>,
     accounts: HashMap<String, Count>,
+    /// client -> failures across every name, so one source cannot fill the other tables
+    clients: HashMap<String, Count>,
     /// account -> clients that signed in successfully (most recent last)
     trusted: HashMap<String, Vec<String>>,
     /// Set when a table could not record a failure: untrusted clients wait for every name.
@@ -200,6 +202,9 @@ const ACCOUNT_FAILURES: u32 = 20;
 const ACCOUNT_WINDOW: Duration = Duration::from_secs(15 * 60);
 const THROTTLE_PAIRS: usize = 10_000;
 const THROTTLE_ACCOUNTS: usize = 10_000;
+/// Failures one client may make across all names within ACCOUNT_WINDOW before it is held off.
+const CLIENT_FAILURES: u32 = 30;
+const THROTTLE_CLIENTS: usize = 10_000;
 const TRUSTED_PER_ACCOUNT: usize = 16;
 
 /// IPv6 clients are counted per /64, the block one subscriber usually controls.
@@ -217,8 +222,9 @@ pub fn client_bucket(ip: &str) -> String {
 /// Make room for one entry: drop the least recently used counter without an active lock (made-up
 /// names first). Returns false when every entry is actively locked.
 fn make_room<K: Clone + std::hash::Hash + Eq>(map: &mut HashMap<K, Count>, now: Instant) -> bool {
+    // Counters of real accounts are never dropped; only made-up names and idle clients make room.
     let victim = map.iter()
-        .filter(|(_, c)| c.active(now).is_none())
+        .filter(|(_, c)| c.active(now).is_none() && !c.real)
         .min_by_key(|(_, c)| (c.real, c.touched))
         .map(|(k, _)| k.clone());
     match victim {
@@ -237,8 +243,10 @@ impl Throttle {
         let st = self.state.lock();
         let now = Instant::now();
         let trusted = st.trusted.get(username).is_some_and(|c| c.contains(&client));
+        let source = st.clients.get(&client).and_then(|c| c.active(now));
         let pair = st.pairs.get(&(username.to_string(), client)).and_then(|c| c.active(now));
         let guard = st.accounts.get(username).and_then(|c| c.active(now))
+            .or(source)
             .or_else(|| st.saturated_until.and_then(|u| u.checked_duration_since(now)))
             .filter(|_| !trusted);
         pair.max(guard)
@@ -249,6 +257,23 @@ impl Throttle {
         let client = client_bucket(client);
         let mut st = self.state.lock();
         let now = Instant::now();
+
+        // Per client, across every name tried (the same for real and made-up names).
+        if !st.clients.contains_key(&client) && st.clients.len() >= THROTTLE_CLIENTS
+            && !make_room(&mut st.clients, now) {
+            st.saturated_until = Some(now + LOCKOUT);
+            return;
+        }
+        let source = st.clients.entry(client.clone()).or_insert_with(|| Count::new(now, false));
+        if now.duration_since(source.since) > ACCOUNT_WINDOW {
+            *source = Count { until: source.until.filter(|u| *u > now), ..Count::new(now, false) };
+        }
+        source.failures += 1;
+        source.touched = now;
+        if source.failures >= CLIENT_FAILURES {
+            source.until = Some(now + LOCKOUT);
+            return; // this client is held off: it no longer adds entries for further names
+        }
 
         if !st.accounts.contains_key(username) && st.accounts.len() >= THROTTLE_ACCOUNTS
             && !make_room(&mut st.accounts, now) {
@@ -404,14 +429,25 @@ mod tests {
     #[test]
     fn made_up_names_cannot_crowd_out_real_accounts() {
         let throttle = Throttle::default();
+        throttle.success("admin", "10.0.0.1"); // the real admin's machine
+        // One source spraying made-up names is held off after CLIENT_FAILURES and stops adding entries.
         for i in 0..(THROTTLE_PAIRS + 50) {
             throttle.failure(&format!("fake{i}"), "10.0.0.9", false);
         }
-        assert!(throttle.state.lock().pairs.len() <= THROTTLE_PAIRS);
-        for _ in 0..MAX_FAILURES {
-            throttle.failure("admin", "10.0.0.9", true);
+        assert!(throttle.state.lock().pairs.len() < CLIENT_FAILURES as usize);
+        assert!(throttle.locked("anyone", "10.0.0.9").is_some(), "the spraying client is held off");
+        assert!(throttle.locked("admin", "10.0.0.1").is_none(), "the admin's machine is unaffected");
+        // Many sources each trying a few names: real accounts are still counted, never evicted.
+        for c in 0..400u32 {
+            for i in 0..25u32 {
+                throttle.failure(&format!("fake{c}-{i}"), &format!("10.1.{}.{}", c / 250, c % 250), false);
+            }
         }
-        assert!(throttle.locked("admin", "10.0.0.9").is_some(), "the real account is still counted");
+        for _ in 0..MAX_FAILURES {
+            throttle.failure("admin", "10.0.0.8", true);
+        }
+        assert!(throttle.locked("admin", "10.0.0.8").is_some(), "the real account is still counted");
+        assert!(throttle.locked("admin", "10.0.0.1").is_none());
     }
 
     #[test]
