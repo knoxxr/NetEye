@@ -1349,7 +1349,12 @@ fn a_full_alert_table_evicts_old_noise_and_folds_the_rest() {
     // Every folded alert is forwarded on its own, carrying what was folded.
     let events = e.take_events();
     let folded: Vec<_> = events.iter().filter(|ev| ev.name.starts_with("경고 수 한도")).collect();
-    assert!(folded.len() as u64 >= overflow["count"].as_u64().unwrap() - 1, "{} folded events", folded.len());
+    // At most FOLD_EVENTS_PER_KEY per drain; the rest are counted on the last event, so the total
+    // still accounts for every fold.
+    let reported = folded.len() as u64 - 1
+        + folded.last().unwrap().details["dropped_events"].as_u64().unwrap_or(0);
+    assert_eq!(reported, overflow["count"].as_u64().unwrap() - 1, "{} events", folded.len());
+    assert!(folded.len() <= 101);
     assert!(folded.iter().skip(1).all(|ev| ev.details["src"].as_str().is_some_and(|s| s.starts_with("10.1."))));
 
     // Acknowledged alerts make room again for new ones.
