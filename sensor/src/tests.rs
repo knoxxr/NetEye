@@ -1329,8 +1329,9 @@ fn a_full_alert_table_evicts_old_noise_and_folds_the_rest() {
     let overflow = alerts.iter().find(|a| a["title"].as_str().unwrap().starts_with("경고 수 한도 도달")).expect("summary");
     assert_eq!(overflow["details"]["recent"].as_array().unwrap().len(), 50, "most recent kept");
     assert!(overflow["count"].as_u64().unwrap() > 50);
+    // Repeated folds share one queued SIEM event per drain (the summary lists the recent ones).
     let forwarded = e.take_events().iter().filter(|ev| ev.name.starts_with("경고 수 한도")).count();
-    assert!(forwarded as u64 >= overflow["count"].as_u64().unwrap() - 1, "every folded alert reaches the SIEM");
+    assert!((1..=2).contains(&forwarded), "{forwarded}");
 
     // Acknowledged alerts make room again for new ones.
     let ids: Vec<u64> = alerts.iter().filter(|a| !a["title"].as_str().unwrap().starts_with("경고 수"))
@@ -1338,6 +1339,7 @@ fn a_full_alert_table_evicts_old_noise_and_folds_the_rest() {
     for id in ids {
         e.acknowledge(id);
     }
+    let _ = e.take_changes(); // the store has them now, so they may leave memory
     feed(&mut e, &[tcp("10.2.0.1", "10.0.0.10", 50000, 502, &mbap(1, &[3, 0, 0, 0, 1]))], T0 + 20_000);
     let s = snap(&mut e);
     assert!(s["alerts"].as_array().unwrap().iter().any(|a| a["src"] == "10.2.0.1"), "admitted after eviction");
