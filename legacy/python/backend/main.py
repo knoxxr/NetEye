@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import threading
@@ -17,11 +18,14 @@ from pydantic import BaseModel, Field
 from backend.capture import import_pcap, start_capture
 from backend.engine import Engine
 from backend.storage import Store
+from backend.vulns import VulnDB
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 DB_PATH = os.getenv("NETEYE_DB", str(ROOT / "data" / "neteye.db"))
 MAX_PCAP_BYTES = int(os.getenv("NETEYE_MAX_PCAP_MB", "512")) * 1024 * 1024
+VULNDB_PATH = Path(os.getenv("NETEYE_VULNDB", str(ROOT / "data" / "vulndb.json")))
+MAX_VULNDB_BYTES = 128 * 1024 * 1024
 FLUSH_INTERVAL_S = 5
 
 store = Store(DB_PATH)
@@ -31,6 +35,12 @@ LEARNING_HOURS = float(os.getenv("NETEYE_LEARNING_HOURS", "0"))
 if LEARNING_HOURS > 0 and engine.baseline.meta_dirty:
     engine.set_mode("learning", LEARNING_HOURS)
 sensor_state: dict = {"enabled": False, "interface": None, "error": None}
+vulndb_state: dict = {"path": str(VULNDB_PATH), "error": None}
+if VULNDB_PATH.exists():
+    try:
+        engine.set_vulndb(VulnDB.load(VULNDB_PATH))
+    except (OSError, ValueError, KeyError) as error:
+        vulndb_state["error"] = f"{VULNDB_PATH.name}: {error}"
 import_state: dict = {"running": False, "file": None, "frames": 0, "error": None, "last_result": None}
 _import_lock = threading.Lock()
 
@@ -66,7 +76,8 @@ app.mount("/assets", StaticFiles(directory=FRONTEND), name="assets")
 
 
 def _payload() -> dict:
-    return {**engine.snapshot(), "sensor": dict(sensor_state), "import": dict(import_state)}
+    return {**engine.snapshot(), "sensor": dict(sensor_state), "import": dict(import_state),
+            "vulndb_state": dict(vulndb_state)}
 
 
 @app.get("/")
@@ -116,6 +127,44 @@ async def set_mode(request: ModeRequest) -> dict:
     status = engine.set_mode(request.mode, request.hours, request.reset)
     await asyncio.to_thread(engine.flush)
     return status
+
+
+@app.get("/api/vulns")
+async def list_vulns() -> list[dict]:
+    """Flattened asset x advisory list, highest risk first."""
+    rows = []
+    for asset in engine.snapshot()["assets"]:
+        for vuln in asset["vulns"]:
+            rows.append({"asset": asset["id"], "label": asset["label"], "vendor": asset["vendor"],
+                         "model": asset["model"], "firmware": asset["firmware"], **vuln})
+    return sorted(rows, key=lambda r: (-r["score"], r["label"]))
+
+
+@app.get("/api/vulndb")
+async def vulndb_info() -> dict:
+    return {"loaded": engine.vulndb is not None, **(engine.vulndb.info() if engine.vulndb else {}),
+            **vulndb_state}
+
+
+@app.post("/api/vulndb")
+async def upload_vulndb(request: Request) -> dict:
+    """Replace the vulnerability database (body: vulndb.json built by backend.vulndb_build)."""
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_VULNDB_BYTES:
+            raise HTTPException(413, "vulnerability database too large")
+    try:
+        db = await asyncio.to_thread(lambda: VulnDB(json.loads(bytes(body))))
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(400, f"invalid vulnerability database: {error}") from error
+    VULNDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = VULNDB_PATH.with_suffix(".tmp")
+    temp.write_bytes(bytes(body))
+    temp.replace(VULNDB_PATH)
+    await asyncio.to_thread(engine.set_vulndb, db)
+    vulndb_state["error"] = None
+    return {"ok": True, **db.info()}
 
 
 def _run_import(path: Path, name: str) -> None:

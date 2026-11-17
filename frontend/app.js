@@ -1,12 +1,8 @@
-const svg = document.getElementById("topology");
-const edgesLayer = document.getElementById("edges");
-const nodesLayer = document.getElementById("nodes");
 const assetList = document.getElementById("asset-list");
 const assetDetail = document.getElementById("asset-detail");
 const searchInput = document.getElementById("asset-search");
 const alertsBody = document.getElementById("alerts-body");
 const showAcked = document.getElementById("show-acked");
-const positions = new Map();
 let latestSnapshot = { assets: [], links: [], alerts: [], stats: {}, sensor: {}, import: {} };
 let selectedId = null;
 
@@ -37,9 +33,23 @@ function shortType(asset) {
   return asset.device_type === "Unknown" ? "미확인 자산" : asset.device_type;
 }
 
+const CRIT_LABEL = { low: "낮음", medium: "보통", high: "높음", critical: "심각" };
+const MANUAL_FIELDS = ["name", "device_type", "vendor", "model", "firmware", "os", "location", "owner", "criticality", "notes"];
+
+/** Name to show: what the operator entered, else the computer name, else the address. */
+function displayName(asset) {
+  return (asset.manual && asset.manual.name) || asset.hostname || asset.label;
+}
+
+function critBadge(asset) {
+  const c = asset.manual && asset.manual.criticality;
+  return c ? `<span class="crit-badge crit-${c}" title="중요도">${CRIT_LABEL[c]}</span>` : "";
+}
+
 function subtitle(asset) {
   const identity = [asset.vendor, asset.model].filter(Boolean).join(" ");
-  return identity || shortType(asset);
+  const host = [asset.hostname, asset.os].filter(Boolean).join(" · ");
+  return identity || host || shortType(asset);
 }
 
 function formatTime(value) {
@@ -53,59 +63,62 @@ function labelOf(id) {
   return asset ? asset.label : id || "-";
 }
 
-function getPosition(asset, index, count) {
-  if (positions.has(asset.id)) return positions.get(asset.id);
-  const hash = [...asset.id].reduce((value, char) => ((value * 31) + char.charCodeAt(0)) >>> 0, 7);
-  const angle = ((hash % 360) * Math.PI) / 180;
-  const ring = Math.floor(index / 12);
-  const radius = Math.min(215, 70 + ring * 46 + Math.min(count, 12) * 6);
-  const position = { x: 480 + Math.cos(angle) * radius, y: 255 + Math.sin(angle) * radius * 0.78 };
-  positions.set(asset.id, position);
-  return position;
+/** Replace an element's markup only when it changed: rebuilding unchanged tables every second is
+ * what made the page stutter, and it also reset hover and text selection. */
+const renderedHtml = new WeakMap();
+function setHtml(element, html) {
+  if (renderedHtml.get(element) === html) return;
+  renderedHtml.set(element, html);
+  element.innerHTML = html;
 }
 
-// Small incremental force layout: nodes repel, linked nodes attract, everything stays in the frame.
-// Positions persist between renders, so the map settles instead of jumping.
-function relax(assets, links, points, iterations = 40) {
-  const W = 960, H = 520, PAD = 45;
-  const ideal = Math.max(70, Math.min(150, 520 / Math.sqrt(assets.length || 1)));
-  for (let iter = 0; iter < iterations; iter += 1) {
-    const force = new Map(assets.map((a) => [a.id, { x: 0, y: 0 }]));
-    for (let i = 0; i < assets.length; i += 1) {
-      for (let j = i + 1; j < assets.length; j += 1) {
-        const a = points.get(assets[i].id), b = points.get(assets[j].id);
-        let dx = a.x - b.x, dy = a.y - b.y;
-        const dist = Math.max(1, Math.hypot(dx, dy));
-        if (dist === 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; }
-        const push = (ideal * ideal) / dist / dist;
-        force.get(assets[i].id).x += (dx / dist) * push; force.get(assets[i].id).y += (dy / dist) * push;
-        force.get(assets[j].id).x -= (dx / dist) * push; force.get(assets[j].id).y -= (dy / dist) * push;
-      }
-    }
-    links.forEach((link) => {
-      const a = points.get(link.source), b = points.get(link.target);
-      if (!a || !b || a === b) return;
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const dist = Math.max(1, Math.hypot(dx, dy));
-      const pull = (dist - ideal) / dist * 0.05;
-      force.get(link.source).x += dx * pull; force.get(link.source).y += dy * pull;
-      force.get(link.target).x -= dx * pull; force.get(link.target).y -= dy * pull;
-    });
-    assets.forEach((asset) => {
-      const p = points.get(asset.id), f = force.get(asset.id);
-      f.x += (W / 2 - p.x) * 0.004; f.y += (H / 2 - p.y) * 0.006;
-      p.x = Math.min(W - PAD, Math.max(PAD, p.x + Math.max(-12, Math.min(12, f.x * 8))));
-      p.y = Math.min(H - PAD, Math.max(PAD - 15, p.y + Math.max(-12, Math.min(12, f.y * 8))));
-    });
-  }
+const graph = new NetGraph(document.querySelector(".graph-wrap"), {
+  onSelect: (id) => {
+    selectedId = id;
+    render(latestSnapshot);
+  },
+});
+const flowButton = document.getElementById("flow-toggle");
+flowButton.setAttribute("aria-pressed", String(graph.flow));
+flowButton.addEventListener("click", () => {
+  graph.setFlow(!graph.flow);
+  flowButton.setAttribute("aria-pressed", String(graph.flow));
+});
+document.getElementById("zoom-in").addEventListener("click", () => graph.zoomBy(1.3));
+document.getElementById("zoom-out").addEventListener("click", () => graph.zoomBy(1 / 1.3));
+document.getElementById("zoom-fit").addEventListener("click", () => graph.fit());
+const graphPanel = document.querySelector(".graph-panel");
+document.getElementById("graph-fullscreen").addEventListener("click", () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else graphPanel.requestFullscreen?.().catch(() => {});
+});
+document.addEventListener("fullscreenchange", () => {
+  // The canvas resizes itself; refit the map to the new frame.
+  setTimeout(() => graph.fit(), 50);
+});
+const graphMode = document.getElementById("graph-mode");
+const graphExternal = document.getElementById("graph-external");
+const graphIsolated = document.getElementById("graph-isolated");
+function syncGraphOptions(options) {
+  graphMode.value = options.mode;
+  graphExternal.checked = options.collapseExternal;
+  graphIsolated.checked = options.hideIsolated;
 }
+graph.onOptions = syncGraphOptions;
+syncGraphOptions(graph.options);
+graphMode.addEventListener("change", () => graph.setOption("mode", graphMode.value));
+graphExternal.addEventListener("change", () => graph.setOption("collapseExternal", graphExternal.checked));
+graphIsolated.addEventListener("change", () => graph.setOption("hideIsolated", graphIsolated.checked));
 
 function searchText(asset) {
-  return [asset.label, asset.ip, asset.device_type, asset.vendor, asset.model, asset.name,
+  const m = asset.manual || {};
+  return [asset.label, asset.ip, asset.device_type, asset.vendor, asset.model, asset.name, asset.hostname, asset.os,
+    m.name, m.location, m.owner, m.notes, CRIT_LABEL[m.criticality],
     asset.firmware, ...(asset.macs || []), ...(asset.protocols || [])].join(" ").toLowerCase();
 }
 
 function render(snapshot) {
+  const fresh = snapshot !== latestSnapshot;
   latestSnapshot = snapshot;
   const assets = snapshot.assets || [];
   const query = searchInput.value.trim().toLowerCase();
@@ -125,62 +138,15 @@ function render(snapshot) {
   renderStatus(snapshot.sensor || {});
   renderImport(snapshot.import || {});
   renderBaseline(snapshot.baseline);
+  renderVulns(snapshot);
+  document.getElementById("stat-vuln").textContent = stats.vulnerable_assets ?? 0;
+  document.getElementById("stat-kev").textContent = stats.kev_assets ?? 0;
 
   // Links whose client issued risky operations are drawn as alert edges.
   const alertPairs = new Set((snapshot.alerts || []).filter((a) => a.status === "new")
     .map((a) => `${a.src}|${a.dst}`));
 
-  const nodePositions = new Map();
-  visibleAssets.forEach((asset, index) => {
-    nodePositions.set(asset.id, getPosition(asset, index, visibleAssets.length));
-  });
-  relax(visibleAssets, visibleLinks, nodePositions);
-
-  // One edge per asset pair; label with application protocols (transport-only labels as fallback).
-  const generic = new Set(["TCP", "UDP", "ICMP", "ISO-TSAP"]);
-  const edges = new Map();
-  visibleLinks.forEach((link) => {
-    const key = `${link.source}|${link.target}`;
-    const edge = edges.get(key) || { source: link.source, target: link.target, protocols: new Set(), last: 0 };
-    edge.protocols.add(link.protocol);
-    edge.last = Math.max(edge.last, Date.parse(link.last_seen));
-    edges.set(key, edge);
-  });
-  edgesLayer.innerHTML = [...edges.values()].map((edge) => {
-    const from = nodePositions.get(edge.source);
-    const to = nodePositions.get(edge.target);
-    const stale = Date.now() - edge.last > 60000;
-    const alerting = alertPairs.has(`${edge.source}|${edge.target}`);
-    const specific = [...edge.protocols].filter((p) => !generic.has(p) && !p.includes("("));
-    const label = (specific.length ? specific : [...edge.protocols]).join(", ");
-    // Stop the line at the node halo so the arrowhead stays visible.
-    const len = Math.max(1, Math.hypot(to.x - from.x, to.y - from.y));
-    const ux = (to.x - from.x) / len, uy = (to.y - from.y) / len;
-    const x1 = from.x + ux * 30, y1 = from.y + uy * 30, x2 = to.x - ux * 31, y2 = to.y - uy * 31;
-    return `<g>
-      <line class="edge-line ${stale ? "edge-stale" : ""} ${alerting ? "edge-alert" : ""}"
-        x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"></line>
-      <text class="edge-label" x="${(from.x + to.x) / 2}" y="${(from.y + to.y) / 2 - 5}" text-anchor="middle">${escapeHtml(label)}</text>
-    </g>`;
-  }).join("");
-
-  const alertAssets = new Set([...alertPairs].flatMap((pair) => pair.split("|")));
-  nodesLayer.innerHTML = visibleAssets.map((asset) => {
-    const point = nodePositions.get(asset.id);
-    const classes = [
-      "node", nodeClass(asset),
-      asset.id === selectedId ? "node-selected" : "",
-      asset.status === "stale" ? "node-offline" : "",
-      alertAssets.has(asset.id) ? "node-alert" : "",
-    ].join(" ");
-    return `<g class="${classes}" data-id="${escapeHtml(asset.id)}" transform="translate(${point.x} ${point.y})">
-      <circle class="node-halo" r="29"></circle>
-      <circle class="node-core" r="20"></circle>
-      <text x="0" y="4" text-anchor="middle" fill="#dce5f2" font-size="12">${asset.device_type === "Unknown" ? "?" : "◆"}</text>
-      <text class="node-label" x="0" y="39">${escapeHtml(asset.label)}</text>
-      <text class="node-sub" x="0" y="51">${escapeHtml(subtitle(asset).slice(0, 34))}</text>
-    </g>`;
-  }).join("");
+  graph.update(visibleAssets, visibleLinks, alertPairs, selectedId, fresh);
 
   renderAssetList(visibleAssets);
   renderAssetDetail(assets.find((asset) => asset.id === selectedId));
@@ -218,27 +184,91 @@ function renderImport(state) {
 
 function renderAssetList(assets) {
   if (assets.length === 0) {
-    assetList.innerHTML = '<div class="list-placeholder">검색 결과가 없습니다.</div>';
+    setHtml(assetList, '<div class="list-placeholder">검색 결과가 없습니다.</div>');
     return;
   }
-  assetList.innerHTML = assets.map((asset) => `
+  setHtml(assetList, assets.map((asset) => `
     <button class="asset-row ${asset.id === selectedId ? "selected" : ""}" data-id="${escapeHtml(asset.id)}">
       <span class="asset-avatar ${nodeClass(asset)}">${asset.device_type === "Unknown" ? "?" : "◆"}</span>
       <span class="asset-row-copy">
-        <strong>${escapeHtml(asset.label)}</strong>
-        <span>${escapeHtml(subtitle(asset))}</span>
+        <strong>${escapeHtml(displayName(asset))}</strong>
+        <span>${escapeHtml(displayName(asset) !== asset.label ? `${asset.label} · ${subtitle(asset)}` : subtitle(asset))}</span>
       </span>
+      ${asset.risk_level && asset.risk_level !== "none" && (asset.vulns || []).some((v) => v.level !== "possible")
+        ? `<span class="risk-badge sev-${asset.risk_level}" title="취약점 위험도">${asset.risk.toFixed(1)}</span>` : ""}
+      ${critBadge(asset)}
       <i class="row-status ${asset.status === "stale" ? "stale" : ""}"></i>
-    </button>`).join("");
+    </button>`).join(""));
 }
 
 function detailItem(label, value) {
   return value ? `<div class="detail-item"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>` : "";
 }
 
+/** A field that may have been entered by hand: marks it and shows the automatic value next to it. */
+function identityItem(asset, label, field) {
+  const value = asset[field];
+  const manual = asset.manual && asset.manual[field];
+  const auto = asset.auto && asset.auto[field];
+  if (!value) return "";
+  const autoNote = manual && auto && auto !== manual ? `<small class="auto-value">자동 식별: ${escapeHtml(auto)}</small>` : "";
+  return `<div class="detail-item"><span>${label}${manual ? '<b class="manual-tag">수동 입력</b>' : ""}</span><strong>${escapeHtml(value)}</strong>${autoNote}</div>`;
+}
+
+function formatValue(v) {
+  if (typeof v !== "number") return "-";
+  return Number.isInteger(v) ? v.toLocaleString() : Number(v.toPrecision(6)).toString();
+}
+
+/** Process points written to this device: last value against what was learned. */
+function pointsDetail(asset) {
+  const points = asset.points || [];
+  if (!points.length) return "";
+  const rows = points.slice(0, 15).map((p) => {
+    const learned = p.learned === 0 ? "학습 안 됨"
+      : p.stateful ? `학습 상태 {${(p.states || []).map(formatValue).join(", ")}}`
+      : `학습 범위 ${formatValue(p.min)} ~ ${formatValue(p.max)}`;
+    const kind = p.kind === "read" ? "측정" : "쓰기";
+    return `<li><span class="point-kind ${p.kind === "read" ? "read" : "write"}">${kind}</span> <b class="mono">${escapeHtml(p.point)}</b> = <span class="mono">${formatValue(p.last)}</span>
+      <small>${escapeHtml(p.protocol)} · ${kind} ${p.writes.toLocaleString()}회 · ${escapeHtml(learned)}</small></li>`;
+  }).join("");
+  const more = points.length > 15 ? `<small class="more">외 ${points.length - 15}개</small>` : "";
+  return `<div class="detail-item"><span>공정 포인트 (쓰기 값·측정값)</span><ul class="point-list">${rows}</ul>${more}</div>`;
+}
+
+function vulnDetail(asset) {
+  const vulns = asset.vulns || [];
+  if (!vulns.length) return "";
+  const items = vulns.slice(0, 8).map((v) => `<li>
+      <span class="sev sev-${riskOf(v.score)}">${v.score.toFixed(1)}</span>
+      ${advisoryLink(v)}${v.kev ? ' <span class="kev">KEV</span>' : ""}
+      <span class="lvl lvl-${v.level}">${escapeHtml(v.level_label)}</span>
+      <small>${escapeHtml(v.versions)} · ${escapeHtml((v.cves || []).slice(0, 3).join(", "))}</small>
+    </li>`).join("");
+  const more = vulns.length > 8 ? `<small class="more">외 ${vulns.length - 8}건 — 아래 취약점 표 참고</small>` : "";
+  return `<div class="detail-item"><span>취약점 (위험도 ${asset.risk.toFixed(1)})</span><ul class="vuln-list">${items}</ul>${more}</div>`;
+}
+
+const SOURCE_TAG = { policy: "정책", baseline: "이탈", anomaly: "통계" };
+
+/** Learned behaviour of a conversation, e.g. "학습: 요청 주기 1.0초 ±0.1 · 분당 60건". */
+function profileText(profile) {
+  if (!profile) return "";
+  const parts = [];
+  const interval = profile.interval || {};
+  if (interval.n >= 20) {
+    const std = interval.n > 1 ? Math.sqrt(interval.m2 / (interval.n - 1)) : 0;
+    const fmt = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}초` : `${Math.round(ms)}ms`);
+    parts.push(`요청 주기 ${fmt(interval.mean)} ±${fmt(std)}`);
+  }
+  const volume = profile.volume || {};
+  if (volume.n >= 5) parts.push(`분당 ${Math.round(volume.mean).toLocaleString()}건`);
+  return parts.length ? `학습: ${parts.join(" · ")}` : "";
+}
+
 function renderAssetDetail(asset) {
   if (!asset) {
-    assetDetail.innerHTML = '<div class="detail-placeholder"><span class="detail-placeholder-icon">◎</span><span>그래프 또는 목록에서 자산을 선택하세요.</span></div>';
+    setHtml(assetDetail, '<div class="detail-placeholder"><span class="detail-placeholder-icon">◎</span><span>그래프 또는 목록에서 자산을 선택하세요.</span></div>');
     return;
   }
   const confidence = Math.round((asset.confidence || 0) * 100);
@@ -252,23 +282,39 @@ function renderAssetDetail(asset) {
     const ops = Object.entries(link.operations || {}).sort((a, b) => b[1] - a[1]).slice(0, 6)
       .map(([op, n]) => `<li>${escapeHtml(op)} <em>×${n}</em></li>`).join("");
     const cats = Object.keys(link.categories || {}).map((c) => CATEGORY_LABEL[c] || c).join(", ");
+    const profile = profileText(link.profile);
     return `<div class="comm">
       <div class="comm-head"><b>${outbound ? "→" : "←"} ${escapeHtml(peer)}</b><span>${escapeHtml(link.protocol)}</span></div>
       ${cats ? `<div class="comm-cats">${escapeHtml(cats)}</div>` : ""}
+      ${profile ? `<div class="comm-profile" title="학습된 정상 패턴 (통계 이상 탐지 기준)">${escapeHtml(profile)}</div>` : ""}
       ${ops ? `<ul class="op-list">${ops}</ul>` : ""}
     </div>`;
   }).join("") : "<span>관측된 통신이 없습니다.</span>";
 
-  assetDetail.innerHTML = `
+  setHtml(assetDetail, `
     <div class="selected-asset">
-      <h3>${escapeHtml(asset.label)}</h3>
-      <p class="asset-type">${escapeHtml(shortType(asset))}</p>
+      <div class="detail-title">
+        <div>
+          <h3>${escapeHtml(displayName(asset))} ${critBadge(asset)}</h3>
+          ${displayName(asset) !== asset.label ? `<p class="asset-ip">${escapeHtml(asset.label)}</p>` : ""}
+        </div>
+        <button class="button ghost" data-edit-asset="${escapeHtml(asset.id)}" data-min-role="operator">정보 편집</button>
+      </div>
+      <p class="asset-type">${escapeHtml(shortType(asset))}${asset.manual && asset.manual.device_type ? ' <b class="manual-tag">수동 입력</b>' : ""}</p>
       <div class="detail-grid">
-        <div class="detail-item"><span>식별 신뢰도</span><strong>${confidence}%</strong><div class="confidence-track"><i style="width:${confidence}%"></i></div></div>
-        ${detailItem("벤더", asset.vendor)}
-        ${detailItem("모델 / 주문번호", asset.model)}
+        ${asset.manual && asset.manual.device_type
+          ? `<div class="detail-item"><span>식별 신뢰도</span><strong>수동 지정</strong><small class="auto-value">자동 식별: ${escapeHtml(asset.auto ? asset.auto.device_type : "")} (${confidence}%)</small></div>`
+          : `<div class="detail-item"><span>식별 신뢰도</span><strong>${confidence}%</strong><div class="confidence-track"><i style="width:${confidence}%"></i></div></div>`}
+        ${asset.manual && asset.manual.location ? detailItem("위치", asset.manual.location) : ""}
+        ${asset.manual && asset.manual.owner ? detailItem("담당자", asset.manual.owner) : ""}
+        ${asset.manual && asset.manual.notes ? `<div class="detail-item"><span>메모</span><strong class="notes">${escapeHtml(asset.manual.notes)}</strong></div>` : ""}
+        ${detailItem("컴퓨터 이름", asset.hostname)}
+        ${asset.manual && asset.manual.os ? identityItem(asset, "운영체제", "os")
+          : asset.os ? `<div class="detail-item"><span>운영체제 (수동 추정 ${Math.round(asset.os_confidence * 100)}%)</span><strong>${escapeHtml(asset.os)}</strong><small class="os-evidence">${escapeHtml(asset.os_evidence)}</small></div>` : ""}
+        ${identityItem(asset, "벤더", "vendor")}
+        ${identityItem(asset, "모델 / 주문번호", "model")}
         ${detailItem("제품 코드", asset.product_code)}
-        ${detailItem("펌웨어", asset.firmware)}
+        ${identityItem(asset, "펌웨어", "firmware")}
         ${detailItem("시리얼", asset.serial)}
         ${detailItem("장비 이름", asset.name)}
         ${detailItem("설명", asset.description)}
@@ -276,15 +322,84 @@ function renderAssetDetail(asset) {
         ${detailItem("VLAN", (asset.vlans || []).join(", "))}
         ${detailItem("역할", (asset.roles || []).join(", "))}
         ${detailItem("관측 프로토콜", (asset.protocols || []).join(", "))}
+        ${vulnDetail(asset)}
+        ${pointsDetail(asset)}
         <div class="detail-item"><span>식별 근거</span>${evidence}</div>
         <div class="detail-item"><span>통신 및 명령</span>${commsHtml}</div>
         ${detailItem("패킷 / 바이트", `${asset.packets.toLocaleString()} / ${asset.bytes.toLocaleString()}`)}
         <div class="detail-item"><span>최초 / 최근 관측</span><strong>${escapeHtml(formatTime(asset.first_seen))}<br>${escapeHtml(formatTime(asset.last_seen))}</strong></div>
+        ${asset.manual && asset.manual.updated_by ? detailItem("정보 수정", `${asset.manual.updated_by} · ${formatTime(asset.manual.updated_at)}`) : ""}
       </div>
-    </div>`;
+    </div>`);
 }
 
 const alertSource = document.getElementById("alert-source");
+const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
+const ROLE_LABEL = { viewer: "조회자", operator: "운영자", admin: "관리자" };
+let currentUser = null;
+
+function can(role) {
+  return currentUser && ROLE_RANK[currentUser.role] >= ROLE_RANK[role];
+}
+
+/** fetch wrapper: an expired or revoked session sends the user back to the login page. */
+async function api(url, options) {
+  const response = await fetch(url, options);
+  if (response.status === 401) {
+    location.replace("/login.html");
+    throw new Error("session expired");
+  }
+  return response;
+}
+const vulnLevel = document.getElementById("vuln-level");
+const vulnsBody = document.getElementById("vulns-body");
+const RISK_LABEL = { critical: "심각", high: "높음", medium: "보통", low: "낮음" };
+
+function vulnRows(assets) {
+  const filter = vulnLevel.value;
+  const rows = [];
+  assets.forEach((asset) => (asset.vulns || []).forEach((v) => {
+    if (filter === "solid" && v.level === "possible") return;
+    if (filter === "kev" && !(v.kev && v.level !== "possible")) return;
+    rows.push({ asset, v });
+  }));
+  return rows.sort((a, b) => b.v.score - a.v.score);
+}
+
+function riskOf(score) {
+  return score >= 9 ? "critical" : score >= 7 ? "high" : score >= 4 ? "medium" : "low";
+}
+
+function advisoryLink(v) {
+  const safe = /^https:\/\//.test(v.url || "") ? v.url : "";
+  return safe ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${escapeHtml(v.id)}</a>` : escapeHtml(v.id);
+}
+
+function renderVulns(snapshot) {
+  const db = snapshot.vulndb;
+  const state = snapshot.vulndb_state || {};
+  const info = document.getElementById("vulndb-info");
+  if (db) {
+    info.textContent = `CISA ICS 권고문 ${db.advisory_count.toLocaleString()}건 · KEV 카탈로그 ${db.sources?.kev_catalog_version || "-"} · DB 생성 ${formatTime(db.built_at)}`;
+  } else if (state.error) {
+    info.textContent = `취약점 DB 로드 실패: ${state.error}`;
+  }
+  const rows = vulnRows(snapshot.assets || []);
+  if (rows.length === 0) {
+    setHtml(vulnsBody, `<tr><td colspan="7" class="empty-row">${db ? "조건에 맞는 취약점이 없습니다." : "취약점 DB를 업로드하면 자산 펌웨어와 자동 대조합니다."}</td></tr>`);
+    return;
+  }
+  setHtml(vulnsBody, rows.slice(0, 300).map(({ asset, v }) => `
+    <tr>
+      <td><span class="sev sev-${riskOf(v.score)}">${v.score.toFixed(1)}</span></td>
+      <td class="mono"><a data-id="${escapeHtml(asset.id)}">${escapeHtml(asset.label)}</a><small>${escapeHtml([asset.model, asset.firmware].filter(Boolean).join(" · "))}</small></td>
+      <td>${advisoryLink(v)}${v.kev ? ' <span class="kev">KEV</span>' : ""}<small>${escapeHtml(v.title)}</small></td>
+      <td>${escapeHtml(v.product)}<small>${escapeHtml(v.versions)}</small></td>
+      <td class="mono">${v.cvss ?? "-"}</td>
+      <td><span class="lvl lvl-${v.level}">${escapeHtml(v.level_label)}</span></td>
+      <td class="fix">${escapeHtml(v.remediation || "-")}</td>
+    </tr>`).join(""));
+}
 
 function renderBaseline(baseline) {
   if (!baseline) return;
@@ -315,7 +430,7 @@ async function setMode(mode, reset = false) {
   const hours = document.getElementById("learn-hours").value;
   const body = { mode, reset };
   if (mode === "learning" && hours) body.hours = Number(hours);
-  const response = await fetch("/api/baseline/mode", {
+  const response = await api("/api/baseline/mode", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
   if (!response.ok) alert(`모드 변경 실패: ${response.status}`);
@@ -326,36 +441,35 @@ function renderAlerts(alerts) {
   const source = alertSource.value;
   const rows = alerts.filter((a) => (showAcked.checked || a.status === "new") && (!source || a.source === source));
   if (rows.length === 0) {
-    alertsBody.innerHTML = `<tr><td colspan="8" class="empty-row">표시할 경고가 없습니다.</td></tr>`;
+    setHtml(alertsBody, `<tr><td colspan="8" class="empty-row">표시할 경고가 없습니다.</td></tr>`);
     return;
   }
-  alertsBody.innerHTML = rows.slice(0, 200).map((a) => `
+  setHtml(alertsBody, rows.slice(0, 200).map((a) => `
     <tr class="${a.status === "acknowledged" ? "acked" : ""}">
       <td><span class="sev sev-${a.severity}">${SEVERITY_LABEL[a.severity] || a.severity}</span></td>
-      <td><span class="src-tag src-${a.source === "baseline" ? "baseline" : "policy"}">${a.source === "baseline" ? "이탈" : "정책"}</span></td>
+      <td><span class="src-tag src-${SOURCE_TAG[a.source] ? a.source : "policy"}">${SOURCE_TAG[a.source] || "정책"}</span></td>
       <td><strong>${escapeHtml(a.title)}</strong>${a.category_label ? `<small>${escapeHtml(a.category_label)}</small>` : ""}</td>
       <td class="mono"><a data-id="${escapeHtml(a.src)}">${escapeHtml(labelOf(a.src))}</a>${a.dst ? ` → <a data-id="${escapeHtml(a.dst)}">${escapeHtml(labelOf(a.dst))}</a>` : ""}</td>
       <td>${escapeHtml(a.protocol)}</td>
       <td class="mono">${a.count}</td>
       <td class="mono">${escapeHtml(formatTime(a.last_seen))}</td>
-      <td class="actions">${a.status === "new"
-        ? `${a.baseline ? `<button class="ack learn" data-learn="${a.id}" title="이 동작을 정상으로 베이스라인에 추가">정상 등록</button>` : ""}<button class="ack" data-ack="${a.id}">확인</button>`
-        : "확인됨"}</td>
-    </tr>`).join("");
+      <td class="actions">${a.status !== "new" ? "확인됨" : !can("operator") ? "" :
+        `${a.baseline ? `<button class="ack learn" data-learn="${a.id}" title="이 동작을 정상으로 베이스라인에 추가">정상 등록</button>` : ""}<button class="ack" data-ack="${a.id}">확인</button>`}</td>
+    </tr>`).join(""));
 }
 
 document.addEventListener("click", async (event) => {
   const learn = event.target.closest("[data-learn]");
   if (learn) {
     learn.disabled = true;
-    await fetch(`/api/alerts/${learn.dataset.learn}/learn`, { method: "POST" });
+    await api(`/api/alerts/${learn.dataset.learn}/learn`, { method: "POST" });
     await loadSnapshot();
     return;
   }
   const ack = event.target.closest("[data-ack]");
   if (ack) {
     ack.disabled = true;
-    await fetch(`/api/alerts/${ack.dataset.ack}/ack`, { method: "POST" });
+    await api(`/api/alerts/${ack.dataset.ack}/ack`, { method: "POST" });
     await loadSnapshot();
     return;
   }
@@ -368,6 +482,21 @@ document.addEventListener("click", async (event) => {
 searchInput.addEventListener("input", () => render(latestSnapshot));
 showAcked.addEventListener("change", () => render(latestSnapshot));
 alertSource.addEventListener("change", () => render(latestSnapshot));
+vulnLevel.addEventListener("change", () => render(latestSnapshot));
+document.getElementById("vulndb-input").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  event.target.value = "";
+  if (!file) return;
+  const info = document.getElementById("vulndb-info");
+  info.textContent = `${file.name} 업로드 및 대조 중…`;
+  const response = await api("/api/vulndb", { method: "POST", headers: { "Content-Type": "application/json" }, body: file });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    info.textContent = `업로드 실패: ${detail.detail || response.status}`;
+    return;
+  }
+  await loadSnapshot();
+});
 document.getElementById("btn-detect").addEventListener("click", () => setMode("detecting"));
 document.getElementById("btn-learn").addEventListener("click", () => setMode("learning"));
 document.getElementById("btn-reset").addEventListener("click", () => {
@@ -383,7 +512,7 @@ document.getElementById("pcap-input").addEventListener("change", async (event) =
   const status = document.getElementById("import-status");
   status.textContent = `${file.name} 업로드 중…`;
   status.className = "import-status running";
-  const response = await fetch("/api/pcap", {
+  const response = await api("/api/pcap", {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream", "X-Filename": encodeURIComponent(file.name) },
     body: file,
@@ -396,7 +525,7 @@ document.getElementById("pcap-input").addEventListener("change", async (event) =
 });
 
 async function loadSnapshot() {
-  const response = await fetch("/api/snapshot");
+  const response = await api("/api/snapshot");
   if (!response.ok) throw new Error(`Snapshot request failed: ${response.status}`);
   render(await response.json());
 }
@@ -405,11 +534,212 @@ function connect() {
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${scheme}//${location.host}/ws`);
   socket.addEventListener("message", (event) => render(JSON.parse(event.data)));
-  socket.addEventListener("close", () => setTimeout(connect, 2000));
+  // The server closes the feed on logout/expiry; the session probe then redirects to the login page.
+  socket.addEventListener("close", () => setTimeout(() => api("/api/session").then(connect, () => {}), 2000));
   socket.addEventListener("error", () => socket.close());
 }
 
-loadSnapshot().catch((error) => {
-  document.getElementById("capture-interface").textContent = `서버 연결 오류: ${error.message}`;
+// ------------------------------------------------------------ account
+function renderUsers(users) {
+  document.getElementById("users-body").innerHTML = users.map((u) => `
+    <tr>
+      <td class="mono">${escapeHtml(u.username)}${u.username === currentUser.username ? " (나)" : ""}</td>
+      <td><select data-user-role="${escapeHtml(u.username)}">
+        ${Object.keys(ROLE_LABEL).map((r) => `<option value="${r}" ${r === u.role ? "selected" : ""}>${ROLE_LABEL[r]}</option>`).join("")}
+      </select></td>
+      <td>${u.must_change ? "비밀번호 변경 대기" : "활성"}</td>
+      <td class="mono">${escapeHtml(formatTime(u.created))}</td>
+      <td class="actions">
+        <button class="ack" data-user-reset="${escapeHtml(u.username)}">비밀번호 재설정</button>
+        ${u.username === currentUser.username ? "" : `<button class="ack" data-user-delete="${escapeHtml(u.username)}">삭제</button>`}
+      </td>
+    </tr>`).join("");
+}
+
+function renderAudit(rows) {
+  document.getElementById("audit-body").innerHTML = rows.length ? rows.map((r) => `
+    <tr class="${r.status >= 400 ? "audit-fail" : ""}">
+      <td class="mono">${escapeHtml(formatTime(r.ts))}</td>
+      <td class="mono">${escapeHtml(r.username)}</td>
+      <td class="mono">${escapeHtml(r.ip)}</td>
+      <td>${escapeHtml(r.action)}${r.detail ? `<small>${escapeHtml(r.detail)}</small>` : ""}</td>
+      <td class="mono">${r.status}</td>
+    </tr>`).join("") : '<tr><td colspan="5" class="empty-row">기록이 없습니다.</td></tr>';
+}
+
+function renderSiem(info) {
+  const el = document.getElementById("siem-status");
+  const syslog = info && info.syslog;
+  if (!syslog) {
+    el.innerHTML = '<strong>SIEM 연동</strong><span>설정 안 됨 — NETEYE_SYSLOG=udp://host:514,tcp://host:601 로 경고·감사 로그를 syslog(CEF/JSON)로 전송합니다.</span>';
+    return;
+  }
+  el.innerHTML = `<strong>SIEM 연동 · ${escapeHtml(syslog.format.toUpperCase())}</strong>` + syslog.destinations.map((d) => {
+    const state = d.transport === "udp" ? "UDP (전달 확인 없음)" : d.connected ? "연결됨" : "연결 끊김";
+    const cls = d.transport === "udp" ? "" : d.connected ? "ok" : "bad";
+    return `<span class="siem-dest ${cls}"><b class="mono">${escapeHtml(d.url)}</b> ${state} · 전송 ${d.sent.toLocaleString()} · 대기 ${d.queued}${d.dropped ? ` · 유실 ${d.dropped}` : ""}${d.last_error ? ` · ${escapeHtml(d.last_error)}` : ""}</span>`;
+  }).join("");
+}
+
+async function loadAdmin() {
+  if (!can("admin")) return;
+  const [users, audit, integrations] = await Promise.all([api("/api/users"), api("/api/audit?limit=100"), api("/api/integrations")]);
+  if (users.ok) renderUsers(await users.json());
+  if (audit.ok) renderAudit(await audit.json());
+  if (integrations.ok) renderSiem(await integrations.json());
+}
+
+async function adminRequest(url, method, body) {
+  const response = await api(url, {
+    method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) alert(data.detail || `요청 실패 (${response.status})`);
+  await loadAdmin();
+  return response.ok;
+}
+
+document.getElementById("user-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = document.getElementById("user-form-status");
+  const ok = await adminRequest("/api/users", "POST", {
+    username: document.getElementById("new-username").value,
+    password: document.getElementById("new-user-password").value,
+    role: document.getElementById("new-user-role").value,
+  });
+  if (ok) {
+    event.target.reset();
+    status.textContent = "추가됨 — 첫 로그인 때 비밀번호를 변경해야 합니다";
+  }
 });
-connect();
+
+document.addEventListener("change", (event) => {
+  const select = event.target.closest("[data-user-role]");
+  if (select) adminRequest(`/api/users/${encodeURIComponent(select.dataset.userRole)}`, "POST", { role: select.value });
+});
+
+document.addEventListener("click", (event) => {
+  const reset = event.target.closest("[data-user-reset]");
+  if (reset) {
+    const password = prompt(`${reset.dataset.userReset}의 임시 비밀번호 (10자 이상). 다음 로그인 때 변경해야 합니다.`);
+    if (password) adminRequest(`/api/users/${encodeURIComponent(reset.dataset.userReset)}`, "POST", { password });
+  }
+  const del = event.target.closest("[data-user-delete]");
+  if (del && confirm(`${del.dataset.userDelete} 사용자를 삭제할까요? 열려 있는 세션도 즉시 종료됩니다.`)) {
+    adminRequest(`/api/users/${encodeURIComponent(del.dataset.userDelete)}`, "DELETE");
+  }
+});
+
+// ------------------------------------------------------------ asset editing
+const assetDialog = document.getElementById("asset-dialog");
+const assetForm = document.getElementById("asset-form");
+let editingAsset = null;
+
+function openAssetEditor(id) {
+  const asset = (latestSnapshot.assets || []).find((a) => a.id === id);
+  if (!asset) return;
+  editingAsset = asset;
+  const manual = asset.manual || {};
+  // Placeholders show what was identified automatically (the value used when the field is empty).
+  const auto = asset.auto || { device_type: asset.device_type, vendor: asset.vendor, model: asset.model,
+    firmware: asset.firmware, os: asset.os };
+  const autoName = asset.hostname || asset.label;
+  MANUAL_FIELDS.forEach((field) => {
+    const input = assetForm.elements[field];
+    input.value = manual[field] || "";
+    if (input.tagName !== "SELECT" && field !== "notes") {
+      const hint = field === "name" ? autoName : auto[field];
+      input.placeholder = hint && hint !== "Unknown" ? `자동: ${hint}` : field === "name" ? "예: 보일러 #2 제어 PLC" : "";
+    }
+  });
+  document.getElementById("asset-dialog-id").textContent = asset.label;
+  document.getElementById("asset-dialog-meta").textContent = manual.updated_by
+    ? `마지막 수정: ${manual.updated_by} · ${formatTime(manual.updated_at)}` : "";
+  document.getElementById("asset-error").hidden = true;
+  assetDialog.showModal();
+  assetForm.elements.name.focus();
+}
+
+async function saveAsset(values) {
+  const error = document.getElementById("asset-error");
+  const response = await api(`/api/assets/${encodeURIComponent(editingAsset.id)}/manual`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    error.textContent = `저장 실패: ${data.detail || response.status}`;
+    error.hidden = false;
+    return;
+  }
+  assetDialog.close();
+  await loadSnapshot();
+}
+
+document.addEventListener("click", (event) => {
+  const edit = event.target.closest("[data-edit-asset]");
+  if (edit) openAssetEditor(edit.dataset.editAsset);
+});
+assetForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const values = Object.fromEntries(MANUAL_FIELDS.map((f) => [f, assetForm.elements[f].value]));
+  saveAsset(values);
+});
+document.getElementById("asset-cancel").addEventListener("click", () => assetDialog.close());
+document.getElementById("asset-clear").addEventListener("click", () => {
+  if (confirm("이 자산에 입력한 정보를 모두 지우고 자동 식별 값으로 되돌릴까요?")) saveAsset({});
+});
+
+document.getElementById("btn-logout").addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST" });
+  location.replace("/login.html");
+});
+
+const passwordDialog = document.getElementById("password-dialog");
+document.getElementById("btn-password").addEventListener("click", () => {
+  document.getElementById("password-form").reset();
+  document.getElementById("pw-error").hidden = true;
+  passwordDialog.showModal();
+});
+document.getElementById("pw-cancel").addEventListener("click", () => passwordDialog.close());
+document.getElementById("password-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const error = document.getElementById("pw-error");
+  const next = document.getElementById("pw-new").value;
+  if (next !== document.getElementById("pw-confirm").value) {
+    error.textContent = "새 비밀번호가 서로 다릅니다.";
+    error.hidden = false;
+    return;
+  }
+  const response = await api("/api/password", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current: document.getElementById("pw-current").value, new: next }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    error.textContent = data.detail || `변경 실패 (${response.status})`;
+    error.hidden = false;
+    return;
+  }
+  passwordDialog.close();
+  alert("비밀번호를 변경했습니다. 다른 기기의 로그인은 종료됩니다.");
+});
+
+async function start() {
+  const response = await api("/api/session");
+  currentUser = await response.json();
+  if (currentUser.must_change_password) {
+    location.replace("/login.html");
+    return;
+  }
+  document.body.dataset.role = currentUser.role;
+  document.getElementById("user-badge").textContent = `${currentUser.username} · ${ROLE_LABEL[currentUser.role]}`;
+  await loadSnapshot().catch((error) => {
+    document.getElementById("capture-interface").textContent = `서버 연결 오류: ${error.message}`;
+  });
+  connect();
+  if (can("admin")) {
+    loadAdmin();
+    setInterval(loadAdmin, 15000);
+  }
+}
+start();

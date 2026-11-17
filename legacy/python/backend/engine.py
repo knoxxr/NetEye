@@ -14,6 +14,7 @@ from backend.baseline import (
 )
 from backend.decode import Frame, decode
 from backend.dissectors.base import CATEGORY_LABELS, CONTROL, PROGRAM, Finding
+from backend.vulns import CONFIRMED, LIKELY, VulnDB, risk_level
 
 ONLINE_WINDOW_S = 60
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -58,7 +59,7 @@ def _is_unicast_mac(mac: str) -> bool:
 
 
 class Engine:
-    def __init__(self, store: Any | None = None) -> None:
+    def __init__(self, store: Any | None = None, vulndb: VulnDB | None = None) -> None:
         self._lock = RLock()
         self.store = store
         self.assets: dict[str, dict[str, Any]] = {}
@@ -76,8 +77,11 @@ class Engine:
         self.stats = {"frames": 0, "dissected": 0}
         self.baseline = Baseline()
         self._baseline_rewrite = False
+        self.vulndb = vulndb
         if store is not None:
             self._load()
+        if vulndb is not None:
+            self.set_vulndb(vulndb)
 
     # ------------------------------------------------------------------ input
     def process_raw(self, data: bytes, ts: float) -> None:
@@ -208,6 +212,7 @@ class Engine:
             if changed:
                 target["evidence"].add(f"{f.protocol} 식별 정보 응답")
                 self._dirty_assets.add(target["id"])
+                self._match_vulns(target, now)
 
         if client is not None and server is not None and frame.src_ip:
             self._link(client, server, f.protocol, frame.size, now, f.operation, f.category,
@@ -236,6 +241,7 @@ class Engine:
             "product_code": "", "device_class": "", "description": "",
             "roles": set(), "protocols": set(), "evidence": set(),
             "packets": 0, "bytes": 0, "first_seen": now, "last_seen": now,
+            "vulns": [], "risk": 0.0, "risk_level": "none",
         }
         self.assets[asset_id] = asset
         self._dirty_assets.add(asset_id)
@@ -309,6 +315,7 @@ class Engine:
         del self.assets[old_id]
         self._deleted_assets.add(old_id)
         self._dirty_assets.add(new_id)
+        self._match_vulns(target, target["last_seen"])
         for key, link in list(self.links.items()):
             if old_id in (link["source"], link["target"]):
                 link["source"] = new_id if link["source"] == old_id else link["source"]
@@ -429,6 +436,36 @@ class Engine:
                     return True
         return False
 
+    # -------------------------------------------------------- vulnerabilities
+    def set_vulndb(self, vulndb: VulnDB | None) -> None:
+        with self._lock:
+            self.vulndb = vulndb
+            for asset in self.assets.values():
+                self._match_vulns(asset, asset["last_seen"])
+
+    def _match_vulns(self, asset: dict, now: str) -> None:
+        if self.vulndb is None or not (asset.get("vendor") or asset.get("model")):
+            vulns: list[dict] = []
+        else:
+            vulns = self.vulndb.match(asset)
+        risk = max((v["score"] for v in vulns), default=0.0)
+        if vulns == asset.get("vulns") and risk == asset.get("risk"):
+            return
+        asset["vulns"], asset["risk"], asset["risk_level"] = vulns, risk, risk_level(risk)
+        self._dirty_assets.add(asset["id"])
+        solid = [v for v in vulns if v["level"] in (CONFIRMED, LIKELY)]
+        kev = [v for v in solid if v["kev"]]
+        if kev:
+            self._alert_once("critical", "악용 중인 취약점(KEV) 보유 자산", asset["id"], now,
+                             {"advisories": ", ".join(v["id"] for v in kev[:5])})
+        elif any(v["level"] == CONFIRMED and (v["cvss"] or 0) >= 9 for v in solid):
+            self._alert_once("high", "치명적(CVSS 9+) 취약점 보유 자산", asset["id"], now,
+                             {"advisories": ", ".join(v["id"] for v in solid if (v["cvss"] or 0) >= 9)})
+
+    def _alert_once(self, severity: str, title: str, asset_id: str, now: str, details: dict) -> None:
+        if f"{title}|{asset_id}|None" not in self.alerts:
+            self._alert(severity, title, "", "Vulnerability", asset_id, None, now, "", details)
+
     def learn_alert(self, alert_id: int) -> bool:
         """Accept the behaviour behind a baseline alert as normal."""
         with self._lock:
@@ -511,6 +548,7 @@ class Engine:
             "links": links,
             "alerts": alerts[:500],
             "baseline": baseline,
+            "vulndb": self.vulndb.info() if self.vulndb else None,
             "stats": {
                 **stats,
                 "asset_count": len(assets),
@@ -518,6 +556,9 @@ class Engine:
                 "link_count": len(links),
                 "alert_open": len(open_alerts),
                 "alert_critical": sum(a["severity"] in ("critical", "high") for a in open_alerts),
+                "vulnerable_assets": sum(1 for a in assets if any(v["level"] != "possible" for v in a["vulns"])),
+                "kev_assets": sum(1 for a in assets if any(v["kev"] and v["level"] != "possible"
+                                                           for v in a["vulns"])),
             },
         }
 
@@ -531,6 +572,9 @@ class Engine:
                 asset[key] = set(asset.get(key, []))
             asset.pop("status", None)
             asset.pop("label", None)
+            asset.setdefault("vulns", [])
+            asset.setdefault("risk", 0.0)
+            asset.setdefault("risk_level", "none")
             self.assets[asset["id"]] = asset
             for mac in asset["macs"]:
                 if asset["ip"]:

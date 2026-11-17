@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 
 from backend.dissectors.base import (
-    CONFIG, CONTROL, DIAGNOSTIC, DISCOVERY, READ, SESSION, WRITE, Finding,
+    CONFIG, CONTROL, DIAGNOSTIC, DISCOVERY, FIRMWARE, READ, SESSION, WRITE, Finding,
 )
 
 PORT = 44818
@@ -48,7 +48,7 @@ LOGIX_SERVICES = {0x4C: ("Read Tag", READ), 0x4D: ("Write Tag", WRITE),
 
 CIP_CLASSES = {0x01: "Identity", 0x02: "Message Router", 0x04: "Assembly", 0x06: "Connection Manager",
                0x64: "Program", 0x6B: "Symbol", 0x6C: "Template", 0x8E: "Controller", 0xF5: "TCP/IP",
-               0xF6: "Ethernet Link"}
+               0xF6: "Ethernet Link", 0xA1: "Non-Volatile Storage"}
 
 VENDORS = {1: "Rockwell Automation/Allen-Bradley"}
 
@@ -164,6 +164,9 @@ def _cip(message: bytes, to_server: bool, finding: Finding) -> None:
             size = struct.unpack_from("<H", request_data, 2)[0]
             _cip(request_data[4:4 + size], to_server, finding)
             return
+    elif cls == 0xA1 and service >= 0x4B:
+        # Object-specific services of the Non-Volatile Storage object carry firmware images.
+        name, category = "Firmware Update", FIRMWARE
     elif service in CIP_SERVICES:
         name, category = CIP_SERVICES[service]
     elif service in LOGIX_SERVICES:
@@ -175,7 +178,9 @@ def _cip(message: bytes, to_server: bool, finding: Finding) -> None:
     finding.operation = f"CIP {name}" + (f" [{target}]" if target else "")
     finding.category = category
     if to_server:
-        if service == 0x05 and cls in (0x01, None):
+        if category == FIRMWARE:
+            finding.alert = ("critical", "CIP 펌웨어 업데이트 (Non-Volatile Storage)")
+        elif service == 0x05 and cls in (0x01, None):
             finding.alert = ("critical", "CIP Identity Reset (장비 재시작) 명령")
         elif service in (0x06, 0x07):
             finding.alert = ("critical", f"CIP {name} 명령" + (f" [{target}]" if target else ""))
