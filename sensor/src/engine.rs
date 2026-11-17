@@ -144,8 +144,10 @@ pub struct ManualInfo {
 }
 
 /// Distinct alerts kept (each one aggregates every repetition of the same event).
-const MAX_ALERTS: usize = 50_000;
+const MAX_ALERTS: usize = if cfg!(test) { 300 } else { 50_000 };
 const ALERT_OVERFLOW_TITLE: &str = "경고 수 한도 도달 (이후 새 경고는 이 항목에 집계)";
+const OVERFLOW_RECENT: usize = 50;
+const EXTERNAL_BUDGET_WINDOW_MS: i64 = 3_600_000;
 /// Internet peers per (alert kind, internal host) that get their own alert before a summary.
 const EXTERNAL_ALERT_PEERS: u32 = 20;
 
@@ -352,8 +354,8 @@ pub struct Engine {
     external: FxHashMap<ExtKey, ExtConn>,
     /// Names learned for addresses that have no asset yet.
     pending_names: FxHashMap<u32, Vec<String>>,
-    /// Internet peers already alerted per (alert title, internal host).
-    external_alert_peers: FxHashMap<(Sym, u32), u32>,
+    /// Internet peers alerted per (alert title, internal host) in the current hour: (count, window start).
+    external_alert_peers: FxHashMap<(Sym, u32), (u32, i64)>,
     next_external_sweep: i64,
     /// New-point alerts per (client, server): (count in window, window start, individual alerts ever).
     new_point_alerts: FxHashMap<(AssetKey, AssetKey), (u32, i64, u32)>,
@@ -1065,11 +1067,19 @@ impl Engine {
         }
         // The first EXTERNAL_ALERT_PEERS internet peers per internal host get their own alert; more
         // (a scan, a spray from many sources) are folded into one summary listing the peers.
-        let peers = self.external_alert_peers.entry((title, key.internal)).or_insert(0);
-        let alert_key = if *peers < EXTERNAL_ALERT_PEERS
-            || self.alerts.contains_key(&AlertKey { title, src, dst: Some(dst) }) {
-            if !self.alerts.contains_key(&AlertKey { title, src, dst: Some(dst) }) {
-                *peers += 1;
+        // Threat-list matches are never folded: every listed address gets its own alert.
+        let threat = self.syms.get(title).starts_with("위협 인텔리전스");
+        if self.external_alert_peers.len() >= 100_000 {
+            self.external_alert_peers.clear();
+        }
+        let budget = self.external_alert_peers.entry((title, key.internal)).or_insert((0, now));
+        if now - budget.1 > EXTERNAL_BUDGET_WINDOW_MS {
+            *budget = (0, now);
+        }
+        let known = self.alerts.contains_key(&AlertKey { title, src, dst: Some(dst) });
+        let alert_key = if threat || known || budget.0 < EXTERNAL_ALERT_PEERS {
+            if !known {
+                budget.0 += 1;
             }
             self.alert(severity, title, proto, op, src, Some(dst), now, "", details, None);
             AlertKey { title, src, dst: Some(dst) }
@@ -1079,16 +1089,29 @@ impl Engine {
             let internal = AssetKey::Ip(key.internal);
             self.alert(severity, summary, proto, op, internal, None, now, "", details, None);
             let k = AlertKey { title: summary, src: internal, dst: None };
+            let mut added = false;
             if let Some(alert) = self.alerts.get_mut(&k) {
                 let peer = Value::from(decode::ip_string(key.external));
                 match alert.details.iter_mut().find(|(n, _)| n == "peers") {
                     Some((_, Value::Array(list))) => {
-                        if !list.contains(&peer) && list.len() < SUMMARY_POINTS {
+                        if !list.contains(&peer) {
+                            // Most recent peers are kept.
+                            if list.len() >= SUMMARY_POINTS {
+                                list.remove(0);
+                            }
                             list.push(peer);
+                            added = true;
                         }
                     }
-                    _ => alert.details.push(("peers".into(), Value::Array(vec![peer]))),
+                    _ => {
+                        alert.details.push(("peers".into(), Value::Array(vec![peer])));
+                        added = true;
+                    }
                 }
+            }
+            // Each new peer in a summary is forwarded to the SIEM as well.
+            if added && self.emit_events && self.events.len() < 100_000 {
+                self.events.push((k, false));
             }
             k
         };
@@ -1123,6 +1146,7 @@ impl Engine {
         if self.external.len() >= MAX_EXTERNAL * 9 / 10 {
             self.external.retain(|_, c| now - c.last_seen < 3_600_000);
         }
+        self.external_alert_peers.retain(|_, (_, start)| now - *start <= EXTERNAL_BUDGET_WINDOW_MS);
         let pending: Vec<ExtKey> = self.external.iter()
             .filter(|(k, c)| !k.inbound && !c.ot_checked && now - c.last_seen < 3_600_000)
             .map(|(k, _)| *k).collect();
@@ -1604,20 +1628,20 @@ impl Engine {
              dst: Option<AssetKey>, now: i64, category: &'static str, details: Vec<(String, Value)>,
              baseline: Option<Item>) {
         let mut key = AlertKey { title, src, dst };
-        let mut details = details;
-        let overflow = !self.alerts.contains_key(&key) && self.alerts.len() >= MAX_ALERTS;
+        let mut overflow = false;
+        if !self.alerts.contains_key(&key) && self.alerts.len() >= MAX_ALERTS && !self.make_alert_room() {
+            // Nothing can be evicted (every alert is open and medium or worse). High and critical
+            // alerts are still admitted up to a hard limit; anything else is counted in a summary.
+            let serious = matches!(severity, "critical" | "high");
+            overflow = !serious || self.alerts.len() >= MAX_ALERTS * 2;
+        }
+        let folded = overflow.then(|| json!({"title": self.syms.get(title), "severity": severity,
+            "src": src.to_string(), "dst": dst.map(|d| d.to_string()), "time": iso(now)}));
         if overflow {
-            // The alert table is full: further new alerts are counted in one summary alert that
-            // names the latest one, so an attacker cannot grow memory (or hide) by creating more.
-            let last = vec![("last_title".to_string(), Value::from(self.syms.get(title))),
-                            ("last_src".to_string(), Value::from(src.to_string())),
-                            ("last_dst".to_string(), Value::from(dst.map(|d| d.to_string())))];
             key = AlertKey { title: self.syms.intern(ALERT_OVERFLOW_TITLE), src: AssetKey::Ip(0), dst: None };
-            details = last;
         }
         let (severity, src, dst) = if overflow { ("high", key.src, key.dst) } else { (severity, src, dst) };
         let next_id = &mut self.next_alert_id;
-        let overflow_details = overflow.then(|| details.clone());
         let alert = self.alerts.entry(key).or_insert_with(|| {
             let id = *next_id;
             *next_id += 1;
@@ -1626,14 +1650,27 @@ impl Engine {
         });
         let created = alert.count == 0;
         alert.count += 1;
-        if let Some(d) = overflow_details {
-            alert.details = d;
+        if let Some(entry) = folded {
+            // The most recent folded alerts stay readable in the summary.
+            if !alert.details.iter().any(|(k, _)| k == "recent") {
+                alert.details = vec![("recent".into(), Value::Array(Vec::new()))];
+            }
+            if let Some((_, Value::Array(list))) = alert.details.iter_mut().find(|(k, _)| k == "recent") {
+                if list.len() >= OVERFLOW_RECENT {
+                    list.remove(0);
+                }
+                list.push(entry);
+            }
         }
         alert.last_seen = alert.last_seen.max(now);
         let mut reopened = false;
         if alert.acknowledged && alert.last_seen == now {
             alert.acknowledged = false; // re-opened by recurrence
             reopened = true;
+        }
+        // Every folded alert is also forwarded, so the SIEM sees each one.
+        if overflow && !created && !reopened && self.emit_events && self.events.len() < 100_000 {
+            self.events.push((key, false));
         }
         // Bounded so a stalled forwarder can never exhaust memory.
         if self.emit_events && (created || reopened) && self.events.len() < 100_000 {
@@ -1643,6 +1680,23 @@ impl Engine {
             alert.dirty = true;
             self.dirty_alerts.push(key);
         }
+    }
+
+    /// Free space in a full alert table: acknowledged alerts first, then open low/info ones, oldest
+    /// first, in batches. Open medium-or-worse alerts are never dropped. (Dropped alerts stay in
+    /// the database.) Returns whether anything was freed.
+    fn make_alert_room(&mut self) -> bool {
+        let mut candidates: Vec<(bool, i64, AlertKey)> = self.alerts.iter()
+            .filter(|(_, a)| a.acknowledged || matches!(a.severity, "low" | "info"))
+            .map(|(k, a)| (!a.acknowledged, a.last_seen, *k)).collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        candidates.sort_unstable_by_key(|c| (c.0, c.1));
+        for (_, _, key) in candidates.into_iter().take(MAX_ALERTS / 20) {
+            self.alerts.remove(&key);
+        }
+        true
     }
 
     fn alert_by_id(&mut self, id: u64) -> Option<&mut Alert> {

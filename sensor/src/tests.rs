@@ -1310,3 +1310,51 @@ fn inbound_sprays_from_many_addresses_fold_into_a_summary() {
     assert_eq!(summary[0]["count"], 10);
     assert_eq!(summary[0]["details"]["peers"].as_array().unwrap().len(), 10);
 }
+
+#[test]
+fn a_full_alert_table_evicts_old_noise_and_folds_the_rest() {
+    let mut e = Engine::new();
+    e.emit_events = true;
+    feed(&mut e, &[tcp("10.0.0.20", "10.0.0.10", 50000, 502, &mbap(1, &[3, 0, 0, 0, 1]))], T0);
+    e.set_mode(Mode::Detecting, None, false);
+    // Hundreds of new hosts, each a baseline alert (new asset / new conversation).
+    let frames: Vec<Vec<u8>> = (0..400u32).map(|i| {
+        tcp(&format!("10.1.{}.{}", i / 250, i % 250 + 1), "10.0.0.10", 50000, 502, &mbap(1, &[3, 0, 0, 0, 1]))
+    }).collect();
+    feed(&mut e, &frames, T0 + 10_000);
+    let s = snap(&mut e);
+    let alerts = s["alerts"].as_array().unwrap();
+    // New-host alerts are high severity: they are admitted up to twice the limit, then folded.
+    assert!(s["stats"]["alert_open"].as_u64().unwrap() <= 601, "bounded: {}", s["stats"]["alert_open"]);
+    let overflow = alerts.iter().find(|a| a["title"].as_str().unwrap().starts_with("경고 수 한도 도달")).expect("summary");
+    assert_eq!(overflow["details"]["recent"].as_array().unwrap().len(), 50, "most recent kept");
+    assert!(overflow["count"].as_u64().unwrap() > 50);
+    let forwarded = e.take_events().iter().filter(|ev| ev.name.starts_with("경고 수 한도")).count();
+    assert!(forwarded as u64 >= overflow["count"].as_u64().unwrap() - 1, "every folded alert reaches the SIEM");
+
+    // Acknowledged alerts make room again for new ones.
+    let ids: Vec<u64> = alerts.iter().filter(|a| !a["title"].as_str().unwrap().starts_with("경고 수"))
+        .take(100).map(|a| a["id"].as_u64().unwrap()).collect();
+    for id in ids {
+        e.acknowledge(id);
+    }
+    feed(&mut e, &[tcp("10.2.0.1", "10.0.0.10", 50000, 502, &mbap(1, &[3, 0, 0, 0, 1]))], T0 + 20_000);
+    let s = snap(&mut e);
+    assert!(s["alerts"].as_array().unwrap().iter().any(|a| a["src"] == "10.2.0.1"), "admitted after eviction");
+}
+
+#[test]
+fn threat_list_matches_are_never_folded() {
+    let mut e = Engine::new();
+    let path = std::env::temp_dir().join(format!("neteye-bl-many-{}.txt", std::process::id()));
+    std::fs::write(&path, "5.6.7.0/24 # Feodo Tracker\n").unwrap();
+    e.set_intel(None, Some(Arc::new(crate::intel::Blocklist::load(&path).unwrap())));
+    let _ = std::fs::remove_file(&path);
+    let frames: Vec<Vec<u8>> = (1..=40u8).map(|i| {
+        tcp_full("10.0.0.20", &format!("5.6.7.{i}"), 50000 + i as u16, 443, &[], HMI_MAC, PLC_MAC, 0x02)
+    }).collect();
+    feed(&mut e, &frames, T0);
+    let s = snap(&mut e);
+    let threat = s["alerts"].as_array().unwrap().iter().filter(|a| a["title"] == "위협 인텔리전스 목록 주소와 통신").count();
+    assert_eq!(threat, 40);
+}
