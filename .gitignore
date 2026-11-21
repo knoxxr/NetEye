@@ -5,3 +5,9 @@ data/
 .playwright-mcp/
 sensor/target/
 dist/
+packaging/android/.gradle/
+packaging/android/build/
+packaging/android/app/build/
+packaging/android/local.properties
+packaging/android/app/src/main/jniLibs/
+packaging/android/app/src/main/assets/

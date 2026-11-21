@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+DATA_DIR="/Library/Application Support/NetEye"
+LOG_DIR="/Library/Logs/NetEye"
+DEFAULTS="/Library/NetEye/defaults"
+PLIST="/Library/LaunchDaemons/com.neteye.sensor.plist"
+
+install -d -m 0700 -o root -g wheel "$DATA_DIR"
+install -d -m 0750 -o root -g wheel "$LOG_DIR"
+
+if [ ! -e "$DATA_DIR/neteye.conf" ] && [ -f "$DEFAULTS/neteye.conf" ]; then
+    install -m 0600 -o root -g wheel "$DEFAULTS/neteye.conf" "$DATA_DIR/neteye.conf"
+fi
+
+for f in vulndb.json ip2asn-v4.tsv.gz; do
+    if [ ! -e "$DATA_DIR/$f" ] && [ -f "$DEFAULTS/$f" ]; then
+        install -m 0644 -o root -g wheel "$DEFAULTS/$f" "$DATA_DIR/$f"
+    fi
+done
+
+chown root:wheel "$PLIST"
+chmod 0644 "$PLIST"
+launchctl bootout system/com.neteye.sensor 2>/dev/null || true
+launchctl bootstrap system "$PLIST"
+launchctl enable system/com.neteye.sensor 2>/dev/null || true
+
+exit 0

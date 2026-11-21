@@ -354,7 +354,7 @@ pub fn required_access(method: &Method, path: &str) -> Access {
         "/" if get => Access::Page,
         "/api/session" if get => Access::Session,
         "/api/logout" | "/api/password" if post => Access::Session,
-        "/api/snapshot" | "/api/alerts" | "/api/baseline" | "/api/vulns" | "/api/vulndb" | "/ws" if get =>
+        "/api/snapshot" | "/api/alerts" | "/api/baseline" | "/api/vulns" | "/api/vulndb" | "/api/version" | "/ws" if get =>
             Access::Role(Role::Viewer),
         "/api/pcap" if post => Access::Role(Role::Operator),
         p if post && p.starts_with("/api/alerts/") && (p.ends_with("/ack") || p.ends_with("/learn")) =>

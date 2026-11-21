@@ -23,6 +23,7 @@ mod pcap;
 mod profile;
 mod siem;
 mod storage;
+mod update;
 mod vulns;
 #[cfg(test)]
 mod tests;
@@ -64,6 +65,9 @@ pub fn config_file() -> Option<PathBuf> {
         if let Some(pd) = std::env::var_os("ProgramData") {
             candidates.push(PathBuf::from(pd).join("NetEye").join("neteye.conf"));
         }
+    } else if cfg!(target_os = "macos") {
+        candidates.push(PathBuf::from("/Library/Application Support/NetEye/neteye.conf"));
+        candidates.push(PathBuf::from("/etc/neteye/neteye.conf"));
     } else {
         candidates.push(PathBuf::from("/etc/neteye/neteye.conf"));
     }
@@ -264,8 +268,12 @@ fn main() {
         "replay" => cmd_replay(args),
         "bench" => cmd_bench(args),
         "interfaces" => cmd_interfaces(),
+        "version" | "--version" | "-V" => {
+            println!("neteye {} ({}/{})", update::VERSION, std::env::consts::OS, std::env::consts::ARCH);
+            Ok(())
+        }
         "config" => {
-            println!("{}", config_file().map(|p| p.display().to_string()).unwrap_or_else(|| "(설정 파일 없음)".into()));
+            println!("{}", config_file().map(|p| p.display().to_string()).unwrap_or_else(|| "(no config file)".into()));
             Ok(())
         }
         "user" => cmd_user(args),
@@ -600,9 +608,35 @@ fn serve() -> Result<(), String> {
                 let _ = tokio::task::spawn_blocking(move || s.flush()).await;
             }
         });
+        let upd_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            loop {
+                let status = upd_state.updater.status();
+                let wait_hours = status.interval_hours.max(1);
+                if status.auto_check {
+                    let mgr = upd_state.updater.clone();
+                    let checked = tokio::task::spawn_blocking(move || mgr.check_now()).await.ok();
+                    if let Some(st) = checked
+                        && st.update_available && st.auto_apply && st.can_self_update {
+                            let mgr2 = upd_state.updater.clone();
+                            let s2 = upd_state.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(res) = mgr2.apply_now() {
+                                    s2.flush();
+                                    if let Some(msg) = res.status_message {
+                                        println!("auto-update: {msg}");
+                                    }
+                                }
+                            }).await;
+                        }
+                }
+                tokio::time::sleep(Duration::from_secs(wait_hours * 3600)).await;
+            }
+        });
         let addr = format!("{}:{}", config.host, config.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| format!("{addr}: {e}"))?;
-        println!("NetEye sensor listening on http://{addr}  (frontend: {})", config.frontend.display());
+        println!("NetEye v{} listening on http://{addr}  (frontend: {})", update::VERSION, config.frontend.display());
         let app = api::router(state.clone());
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })

@@ -32,7 +32,7 @@ loginForm.addEventListener("submit", async (event) => {
     password,
   });
   if (!result.ok) {
-    showError("login-error", result.data.detail || `로그인 실패 (${result.status})`);
+    showError("login-error", result.data.detail || `Sign-in failed (${result.status})`);
     return;
   }
   if (result.data.must_change_password) {
@@ -48,12 +48,12 @@ changeForm.addEventListener("submit", async (event) => {
   showError("change-error", "");
   const next = document.getElementById("new-password").value;
   if (next !== document.getElementById("confirm-password").value) {
-    showError("change-error", "새 비밀번호가 서로 다릅니다.");
+    showError("change-error", "New passwords do not match.");
     return;
   }
   const result = await postJson("/api/password", { current: document.getElementById("current").value, new: next });
   if (!result.ok) {
-    showError("change-error", result.data.detail || `변경 실패 (${result.status})`);
+    showError("change-error", result.data.detail || `Password update failed (${result.status})`);
     return;
   }
   location.replace("/");

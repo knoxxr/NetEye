@@ -108,8 +108,8 @@ pub fn find_bangdb() -> Option<PathBuf> {
 // The managed bangdb must not outlive the sensor: an orphan would keep the database file locked
 // and make the next start fail. Graceful exits stop it in `Drop`; these cover crashes and kills.
 
-/// Linux: the kernel sends SIGKILL to bangdb when the sensor dies.
-#[cfg(target_os = "linux")]
+/// Linux / Android: the kernel sends SIGKILL to bangdb when the sensor dies.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn tie_to_parent(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: prctl is async-signal-safe and touches only the child being created.
@@ -121,7 +121,7 @@ fn tie_to_parent(command: &mut Command) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn tie_to_parent(_: &mut Command) {}
 
 /// Windows: put bangdb in a job object that kills its members when the sensor's handle closes,

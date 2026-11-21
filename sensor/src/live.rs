@@ -9,6 +9,9 @@ use std::sync::Arc;
 #[repr(C)]
 struct TimeVal {
     tv_sec: c_long,
+    #[cfg(target_os = "macos")]
+    tv_usec: c_int,
+    #[cfg(not(target_os = "macos"))]
     tv_usec: c_long,
 }
 

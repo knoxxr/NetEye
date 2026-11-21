@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.neteye.sensor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/NetEye/neteye</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NETEYE_CONFIG</key>
+        <string>/Library/Application Support/NetEye/neteye.conf</string>
+        <key>NETEYE_FRONTEND</key>
+        <string>/Library/NetEye/frontend</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/NetEye</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/NetEye/neteye.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/NetEye/neteye.log</string>
+</dict>
+</plist>

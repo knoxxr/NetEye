@@ -6,11 +6,15 @@ const showAcked = document.getElementById("show-acked");
 let latestSnapshot = { assets: [], links: [], alerts: [], stats: {}, sensor: {}, import: {} };
 let selectedId = null;
 
-const SEVERITY_LABEL = { critical: "심각", high: "높음", medium: "보통", low: "낮음", info: "정보" };
+const SEVERITY_LABEL = { critical: "Critical", high: "High", medium: "Medium", low: "Low", info: "Info" };
 const CATEGORY_LABEL = {
-  read: "읽기", monitor: "모니터링", session: "세션", discovery: "탐색", diagnostic: "진단",
-  write: "쓰기", command: "제어 명령", config: "설정 변경", program: "프로그램 변경",
-  control: "운전 상태 제어", firmware: "펌웨어",
+  read: "Read", monitor: "Monitor", session: "Session", discovery: "Discovery", diagnostic: "Diagnostic",
+  write: "Write", command: "Command", config: "Configuration", program: "Program",
+  control: "State Control", firmware: "Firmware",
+};
+const LEVEL_LABEL = {
+  confirmed: "Confirmed", likely: "Likely", possible: "Possible",
+  "확정": "Confirmed", "유력": "Likely", "가능": "Possible",
 };
 
 function escapeHtml(value) {
@@ -20,7 +24,7 @@ function escapeHtml(value) {
 }
 
 function nodeClass(asset) {
-  const type = asset.device_type.toLowerCase();
+  const type = String(asset.device_type || "Unknown").toLowerCase();
   if (type.includes("plc")) return "node-type-plc";
   if (type.includes("rtu") || type.includes("ied") || type.includes("merging")) return "node-type-power";
   if (type.includes("workstation") || type.includes("hmi") || type.includes("scada")) return "node-type-workstation";
@@ -30,23 +34,23 @@ function nodeClass(asset) {
 }
 
 function shortType(asset) {
-  return asset.device_type === "Unknown" ? "미확인 자산" : asset.device_type;
+  return !asset.device_type || asset.device_type === "Unknown" ? "Unknown Asset" : asset.device_type;
 }
 
-const CRIT_LABEL = { low: "낮음", medium: "보통", high: "높음", critical: "심각" };
+const CRIT_LABEL = { low: "Low", medium: "Medium", high: "High", critical: "Critical" };
 const MANUAL_FIELDS = ["name", "device_type", "vendor", "model", "firmware", "os", "location", "owner", "criticality", "notes"];
 
-/** Name to show: what the operator entered, else the computer name, else the address. */
+/** Name to show: what the operator entered, else the hostname, else the address. */
 function displayName(asset) {
   return (asset.manual && asset.manual.name) || asset.hostname || asset.label;
 }
 
 function critBadge(asset) {
   const c = asset.manual && asset.manual.criticality;
-  return c ? `<span class="crit-badge crit-${c}" title="중요도">${CRIT_LABEL[c]}</span>` : "";
+  return c && CRIT_LABEL[c] ? `<span class="crit-badge crit-${escapeHtml(c)}" title="Criticality">${CRIT_LABEL[c]}</span>` : "";
 }
 
-/** Who an internet address belongs to: organisation (AS) and the name used to reach it. */
+/** Who an internet address belongs to: organization (AS) and the domain used to reach it. */
 function orgText(asset) {
   const parts = [asset.org && asset.org.name, asset.domains && asset.domains[asset.domains.length - 1]].filter(Boolean);
   return parts.join(" · ");
@@ -61,7 +65,9 @@ function subtitle(asset) {
 function formatTime(value) {
   if (!value) return "";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("ko-KR", { hour12: false });
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("en-US", {
+    year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
 }
 
 /** Asset by id, through an index built once per snapshot (lists and details look up many). */
@@ -80,7 +86,7 @@ function labelOf(id) {
   return asset ? asset.label : id || "-";
 }
 
-/** Who a peer is, in one short line: entered name / computer name, organisation, domain. */
+/** Who a peer is, in one short line: manual name / hostname, organization, domain. */
 function peerDescription(id) {
   const asset = assetById(id);
   if (!asset) return "";
@@ -88,7 +94,7 @@ function peerDescription(id) {
   const named = (asset.manual && asset.manual.name) || asset.hostname;
   if (named) parts.push(escapeHtml(named));
   if (asset.org) {
-    parts.push(`${escapeHtml(asset.org.name)}${asset.org.well_known ? ' <span class="well">잘 알려진</span>' : ""}`);
+    parts.push(`${escapeHtml(asset.org.name)}${asset.org.well_known ? ' <span class="well">Well-known</span>' : ""}`);
   }
   const domain = (asset.domains || []).slice(-1)[0];
   if (domain) parts.push(`<span class="mono">${escapeHtml(domain)}</span>`);
@@ -96,8 +102,7 @@ function peerDescription(id) {
   return parts.join(" · ");
 }
 
-/** Replace an element's markup only when it changed: rebuilding unchanged tables every second is
- * what made the page stutter, and it also reset hover and text selection. */
+/** Replace an element's markup only when it changed: avoids table flicker and preserves selection. */
 const renderedHtml = new WeakMap();
 function setHtml(element, html) {
   if (renderedHtml.get(element) === html) return;
@@ -126,7 +131,6 @@ document.getElementById("graph-fullscreen").addEventListener("click", () => {
   else graphPanel.requestFullscreen?.().catch(() => {});
 });
 document.addEventListener("fullscreenchange", () => {
-  // The canvas resizes itself; refit the map to the new frame.
   setTimeout(() => graph.fit(), 50);
 });
 const graphMode = document.getElementById("graph-mode");
@@ -177,7 +181,6 @@ function render(snapshot) {
   document.getElementById("stat-vuln").textContent = stats.vulnerable_assets ?? 0;
   document.getElementById("stat-kev").textContent = stats.kev_assets ?? 0;
 
-  // Links whose client issued risky operations are drawn as alert edges.
   const alertPairs = new Set((snapshot.alerts || []).filter((a) => a.status === "new")
     .map((a) => `${a.src}|${a.dst}`));
 
@@ -191,12 +194,12 @@ function render(snapshot) {
 
 function renderStatus(sensor) {
   const pill = document.getElementById("sensor-status");
-  const label = sensor.error ? "센서 오류" : sensor.enabled ? "패킷 수집 중" : "실시간 수집 꺼짐";
+  const label = sensor.error ? "Sensor Error" : sensor.enabled ? "Live Capture Active" : "Live Capture Off";
   pill.className = `status-pill ${sensor.error ? "status-error" : sensor.enabled ? "status-online" : "status-offline"}`;
   pill.innerHTML = `<span class="status-dot"></span>${label}`;
   const interfaceLabel = sensor.interface
-    ? `수집 인터페이스: ${sensor.interface}`
-    : "NETEYE_INTERFACE 환경 변수로 실시간 수집 인터페이스를 설정하거나 PCAP을 분석하세요";
+    ? `Capture interface: ${sensor.interface}`
+    : "Set NETEYE_INTERFACE for live capture or upload a PCAP file";
   document.getElementById("capture-interface").textContent = sensor.error
     ? `${interfaceLabel} · ${sensor.error}` : interfaceLabel;
   pill.title = sensor.error || "";
@@ -205,13 +208,13 @@ function renderStatus(sensor) {
 function renderImport(state) {
   const el = document.getElementById("import-status");
   if (state.running) {
-    el.textContent = `${state.file} 분석 중… ${state.frames.toLocaleString()} 프레임`;
+    el.textContent = `Analyzing ${state.file}… ${state.frames.toLocaleString()} frames`;
     el.className = "import-status running";
   } else if (state.error) {
-    el.textContent = `분석 실패: ${state.error}`;
+    el.textContent = `Import failed: ${state.error}`;
     el.className = "import-status error";
   } else if (state.last_result) {
-    el.textContent = `${state.last_result.file}: ${state.last_result.frames.toLocaleString()} 프레임 분석 완료`;
+    el.textContent = `${state.last_result.file}: ${state.last_result.frames.toLocaleString()} frames analyzed`;
     el.className = "import-status";
   } else {
     el.textContent = "";
@@ -220,7 +223,7 @@ function renderImport(state) {
 
 function renderAssetList(assets) {
   if (assets.length === 0) {
-    setHtml(assetList, '<div class="list-placeholder">검색 결과가 없습니다.</div>');
+    setHtml(assetList, '<div class="list-placeholder">No matching assets found.</div>');
     return;
   }
   setHtml(assetList, assets.map((asset) => `
@@ -231,7 +234,7 @@ function renderAssetList(assets) {
         <span>${escapeHtml(displayName(asset) !== asset.label ? `${asset.label} · ${subtitle(asset)}` : subtitle(asset))}</span>
       </span>
       ${asset.risk_level && asset.risk_level !== "none" && (asset.vulns || []).some((v) => v.level !== "possible")
-        ? `<span class="risk-badge sev-${asset.risk_level}" title="취약점 위험도">${asset.risk.toFixed(1)}</span>` : ""}
+        ? `<span class="risk-badge sev-${escapeHtml(asset.risk_level)}" title="Vulnerability Risk Score">${asset.risk.toFixed(1)}</span>` : ""}
       ${critBadge(asset)}
       <i class="row-status ${asset.status === "stale" ? "stale" : ""}"></i>
     </button>`).join(""));
@@ -241,14 +244,13 @@ function detailItem(label, value) {
   return value ? `<div class="detail-item"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>` : "";
 }
 
-/** A field that may have been entered by hand: marks it and shows the automatic value next to it. */
 function identityItem(asset, label, field) {
   const value = asset[field];
   const manual = asset.manual && asset.manual[field];
   const auto = asset.auto && asset.auto[field];
   if (!value) return "";
-  const autoNote = manual && auto && auto !== manual ? `<small class="auto-value">자동 식별: ${escapeHtml(auto)}</small>` : "";
-  return `<div class="detail-item"><span>${label}${manual ? '<b class="manual-tag">수동 입력</b>' : ""}</span><strong>${escapeHtml(value)}</strong>${autoNote}</div>`;
+  const autoNote = manual && auto && auto !== manual ? `<small class="auto-value">Auto-detected: ${escapeHtml(auto)}</small>` : "";
+  return `<div class="detail-item"><span>${label}${manual ? '<b class="manual-tag">Manual</b>' : ""}</span><strong>${escapeHtml(value)}</strong>${autoNote}</div>`;
 }
 
 function formatValue(v) {
@@ -256,36 +258,35 @@ function formatValue(v) {
   return Number.isInteger(v) ? v.toLocaleString() : Number(v.toPrecision(6)).toString();
 }
 
-/** Process points written to this device: last value against what was learned. */
 function pointsDetail(asset) {
   const points = asset.points || [];
   if (!points.length) return "";
   const rows = points.slice(0, 15).map((p) => {
-    const learned = p.learned === 0 ? "학습 안 됨"
-      : p.stateful ? `학습 상태 {${(p.states || []).map(formatValue).join(", ")}}`
-      : `학습 범위 ${formatValue(p.min)} ~ ${formatValue(p.max)}`;
-    const kind = p.kind === "read" ? "측정" : "쓰기";
+    const learned = p.learned === 0 ? "Not learned"
+      : p.stateful ? `Learned states {${(p.states || []).map(formatValue).join(", ")}}`
+      : `Learned range ${formatValue(p.min)} ~ ${formatValue(p.max)}`;
+    const kind = p.kind === "read" ? "Measure" : "Write";
     return `<li><span class="point-kind ${p.kind === "read" ? "read" : "write"}">${kind}</span> <b class="mono">${escapeHtml(p.point)}</b> = <span class="mono">${formatValue(p.last)}</span>
-      <small>${escapeHtml(p.protocol)} · ${kind} ${p.writes.toLocaleString()}회 · ${escapeHtml(learned)}</small></li>`;
+      <small>${escapeHtml(p.protocol)} · ${kind} ×${p.writes.toLocaleString()} · ${escapeHtml(learned)}</small></li>`;
   }).join("");
-  const more = points.length > 15 ? `<small class="more">외 ${points.length - 15}개</small>` : "";
-  return `<div class="detail-item"><span>공정 포인트 (쓰기 값·측정값)</span><ul class="point-list">${rows}</ul>${more}</div>`;
+  const more = points.length > 15 ? `<small class="more">+${points.length - 15} more points</small>` : "";
+  return `<div class="detail-item"><span>Process Points (Writes &amp; Measurements)</span><ul class="point-list">${rows}</ul>${more}</div>`;
 }
 
 function levelOf(score) {
-  return score >= 70 ? ["lv-danger", "위험"] : score >= 30 ? ["lv-warn", "주의"] : score > 0 ? ["lv-note", "참고"] : ["lv-ok", "정상"];
+  return score >= 70 ? ["lv-danger", "High Risk"] : score >= 30 ? ["lv-warn", "Warning"] : score > 0 ? ["lv-note", "Notice"] : ["lv-ok", "Normal"];
 }
 
 function externalDetail(asset) {
   if (!asset.org && !(asset.domains || []).length) return "";
   const ext = (latestSnapshot.external || []).find((e) => e.id === asset.id);
   const org = asset.org;
-  const orgLine = org ? `${escapeHtml(org.name)}${org.well_known ? ' <span class="well">잘 알려진 조직</span>' : ""}
-      <small>AS${org.asn} · ${escapeHtml(org.holder)} · ${escapeHtml(org.country)}</small>` : "조직 정보 없음";
+  const orgLine = org ? `${escapeHtml(org.name)}${org.well_known ? ' <span class="well">Well-known</span>' : ""}
+      <small>AS${org.asn} · ${escapeHtml(org.holder)} · ${escapeHtml(org.country)}</small>` : "Unknown organization";
   const [cls, label] = levelOf(ext ? ext.score : 0);
-  return `<div class="detail-item ext-org"><span>외부 주소 소유 조직</span><strong>${orgLine}</strong></div>
-    ${(asset.domains || []).length ? detailItem("접속에 쓰인 이름 (DNS·SNI·Host)", asset.domains.join(", ")) : ""}
-    ${ext ? `<div class="detail-item"><span>외부 통신 판단</span><strong><span class="ext-level ${cls}">${label}</span></strong>
+  return `<div class="detail-item ext-org"><span>External Organization (ASN)</span><strong>${orgLine}</strong></div>
+    ${(asset.domains || []).length ? detailItem("Observed Domains (DNS·SNI·Host)", asset.domains.join(", ")) : ""}
+    ${ext ? `<div class="detail-item"><span>External Risk Rating</span><strong><span class="ext-level ${cls}">${label}</span></strong>
       ${ext.reasons.length ? `<small class="ext-reasons">${ext.reasons.map(escapeHtml).join("<br>")}</small>` : ""}</div>` : ""}`;
 }
 
@@ -295,40 +296,38 @@ function vulnDetail(asset) {
   const items = vulns.slice(0, 8).map((v) => `<li>
       <span class="sev sev-${riskOf(v.score)}">${v.score.toFixed(1)}</span>
       ${advisoryLink(v)}${v.kev ? ' <span class="kev">KEV</span>' : ""}
-      <span class="lvl lvl-${v.level}">${escapeHtml(v.level_label)}</span>
+      <span class="lvl lvl-${escapeHtml(v.level)}">${escapeHtml(LEVEL_LABEL[v.level] || LEVEL_LABEL[v.level_label] || v.level_label)}</span>
       <small>${escapeHtml(v.versions)} · ${escapeHtml((v.cves || []).slice(0, 3).join(", "))}</small>
     </li>`).join("");
-  const more = vulns.length > 8 ? `<small class="more">외 ${vulns.length - 8}건 — 아래 취약점 표 참고</small>` : "";
-  return `<div class="detail-item"><span>취약점 (위험도 ${asset.risk.toFixed(1)})</span><ul class="vuln-list">${items}</ul>${more}</div>`;
+  const more = vulns.length > 8 ? `<small class="more">+${vulns.length - 8} more — see Vulnerabilities table below</small>` : "";
+  return `<div class="detail-item"><span>Vulnerabilities (Risk ${asset.risk.toFixed(1)})</span><ul class="vuln-list">${items}</ul>${more}</div>`;
 }
 
-const SOURCE_TAG = { policy: "정책", baseline: "이탈", anomaly: "통계", external: "외부" };
+const SOURCE_TAG = { policy: "Policy", baseline: "Baseline", anomaly: "Anomaly", external: "External" };
 
-/** Learned behaviour of a conversation, e.g. "학습: 요청 주기 1.0초 ±0.1 · 분당 60건". */
 function profileText(profile) {
   if (!profile) return "";
   const parts = [];
   const interval = profile.interval || {};
   if (interval.n >= 20) {
     const std = interval.n > 1 ? Math.sqrt(interval.m2 / (interval.n - 1)) : 0;
-    const fmt = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}초` : `${Math.round(ms)}ms`);
-    parts.push(`요청 주기 ${fmt(interval.mean)} ±${fmt(std)}`);
+    const fmt = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
+    parts.push(`Poll interval ${fmt(interval.mean)} ±${fmt(std)}`);
   }
   const volume = profile.volume || {};
-  if (volume.n >= 5) parts.push(`분당 ${Math.round(volume.mean).toLocaleString()}건`);
-  return parts.length ? `학습: ${parts.join(" · ")}` : "";
+  if (volume.n >= 5) parts.push(`${Math.round(volume.mean).toLocaleString()} pkt/min`);
+  return parts.length ? `Learned: ${parts.join(" · ")}` : "";
 }
 
 function renderAssetDetail(asset) {
   if (!asset) {
-    setHtml(assetDetail, '<div class="detail-placeholder"><span class="detail-placeholder-icon">◎</span><span>그래프 또는 목록에서 자산을 선택하세요.</span></div>');
+    setHtml(assetDetail, '<div class="detail-placeholder"><span class="detail-placeholder-icon">◎</span><span>Select an asset from the map or list.</span></div>');
     return;
   }
   const confidence = Math.round((asset.confidence || 0) * 100);
   const evidence = (asset.evidence || []).length
     ? `<ul class="evidence-list">${asset.evidence.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
-    : "<span>아직 식별 근거가 없습니다.</span>";
-  // Busiest conversations first; long lists (a PC talking to hundreds of internet hosts) are cut.
+    : "<span>No identification evidence observed yet.</span>";
   const allComms = (latestSnapshot.links || []).filter((l) => l.source === asset.id || l.target === asset.id)
     .sort((a, b) => b.packets - a.packets);
   const comms = allComms.slice(0, 40);
@@ -348,11 +347,11 @@ function renderAssetDetail(asset) {
       <div class="comm-head"><b>${outbound ? "→" : "←"} <a data-id="${escapeHtml(peerId)}">${escapeHtml(peer)}</a></b><span>${escapeHtml(link.protocol)}</span></div>
       ${about || level ? `<div class="comm-peer ext-org">${level ? `<span class="ext-level ${cls}">${level}</span> ` : ""}${about}</div>` : ""}
       ${cats ? `<div class="comm-cats">${escapeHtml(cats)}</div>` : ""}
-      ${profile ? `<div class="comm-profile" title="학습된 정상 패턴 (통계 이상 탐지 기준)">${escapeHtml(profile)}</div>` : ""}
+      ${profile ? `<div class="comm-profile" title="Learned statistical baseline">${escapeHtml(profile)}</div>` : ""}
       ${ops ? `<ul class="op-list">${ops}</ul>` : ""}
     </div>`;
-  }).join("") + (allComms.length > comms.length ? `<small class="more">패킷이 많은 ${comms.length}개만 표시 · 전체 ${allComms.length}개</small>` : "")
-    : "<span>관측된 통신이 없습니다.</span>";
+  }).join("") + (allComms.length > comms.length ? `<small class="more">Showing top ${comms.length} of ${allComms.length} links</small>` : "")
+    : "<span>No communications observed.</span>";
 
   setHtml(assetDetail, `
     <div class="selected-asset">
@@ -361,52 +360,51 @@ function renderAssetDetail(asset) {
           <h3>${escapeHtml(displayName(asset))} ${critBadge(asset)}</h3>
           ${displayName(asset) !== asset.label ? `<p class="asset-ip">${escapeHtml(asset.label)}</p>` : ""}
         </div>
-        <button class="button ghost" data-edit-asset="${escapeHtml(asset.id)}" data-min-role="operator">정보 편집</button>
+        <button class="button ghost" data-edit-asset="${escapeHtml(asset.id)}" data-min-role="operator">Edit Info</button>
       </div>
-      <p class="asset-type">${escapeHtml(shortType(asset))}${asset.manual && asset.manual.device_type ? ' <b class="manual-tag">수동 입력</b>' : ""}</p>
+      <p class="asset-type">${escapeHtml(shortType(asset))}${asset.manual && asset.manual.device_type ? ' <b class="manual-tag">Manual</b>' : ""}</p>
       <div class="detail-grid">
         ${asset.manual && asset.manual.device_type
-          ? `<div class="detail-item"><span>식별 신뢰도</span><strong>수동 지정</strong><small class="auto-value">자동 식별: ${escapeHtml(asset.auto ? asset.auto.device_type : "")} (${confidence}%)</small></div>`
-          : `<div class="detail-item"><span>식별 신뢰도</span><strong>${confidence}%</strong><div class="confidence-track"><i style="width:${confidence}%"></i></div></div>`}
-        ${asset.manual && asset.manual.location ? detailItem("위치", asset.manual.location) : ""}
-        ${asset.manual && asset.manual.owner ? detailItem("담당자", asset.manual.owner) : ""}
-        ${asset.manual && asset.manual.notes ? `<div class="detail-item"><span>메모</span><strong class="notes">${escapeHtml(asset.manual.notes)}</strong></div>` : ""}
+          ? `<div class="detail-item"><span>Confidence</span><strong>Manual Override</strong><small class="auto-value">Auto-detected: ${escapeHtml(asset.auto ? asset.auto.device_type : "")} (${confidence}%)</small></div>`
+          : `<div class="detail-item"><span>Identification Confidence</span><strong>${confidence}%</strong><div class="confidence-track"><i style="width:${confidence}%"></i></div></div>`}
+        ${asset.manual && asset.manual.location ? detailItem("Location", asset.manual.location) : ""}
+        ${asset.manual && asset.manual.owner ? detailItem("Owner", asset.manual.owner) : ""}
+        ${asset.manual && asset.manual.notes ? `<div class="detail-item"><span>Notes</span><strong class="notes">${escapeHtml(asset.manual.notes)}</strong></div>` : ""}
         ${externalDetail(asset)}
-        ${detailItem("컴퓨터 이름", asset.hostname)}
-        ${asset.manual && asset.manual.os ? identityItem(asset, "운영체제", "os")
-          : asset.os ? `<div class="detail-item"><span>운영체제 (수동 추정 ${Math.round(asset.os_confidence * 100)}%)</span><strong>${escapeHtml(asset.os)}</strong><small class="os-evidence">${escapeHtml(asset.os_evidence)}</small></div>` : ""}
-        ${identityItem(asset, "벤더", "vendor")}
-        ${identityItem(asset, "모델 / 주문번호", "model")}
-        ${detailItem("제품 코드", asset.product_code)}
-        ${identityItem(asset, "펌웨어", "firmware")}
-        ${detailItem("시리얼", asset.serial)}
-        ${detailItem("장비 이름", asset.name)}
-        ${detailItem("설명", asset.description)}
-        ${detailItem("MAC 주소", (asset.macs || []).join(", ") || "미확인")}
+        ${detailItem("Hostname", asset.hostname)}
+        ${asset.manual && asset.manual.os ? identityItem(asset, "Operating System", "os")
+          : asset.os ? `<div class="detail-item"><span>Operating System (Passive ${Math.round(asset.os_confidence * 100)}%)</span><strong>${escapeHtml(asset.os)}</strong><small class="os-evidence">${escapeHtml(asset.os_evidence)}</small></div>` : ""}
+        ${identityItem(asset, "Vendor", "vendor")}
+        ${identityItem(asset, "Model / Order Number", "model")}
+        ${detailItem("Product Code", asset.product_code)}
+        ${identityItem(asset, "Firmware", "firmware")}
+        ${detailItem("Serial Number", asset.serial)}
+        ${detailItem("Station Name", asset.name)}
+        ${detailItem("Description", asset.description)}
+        ${detailItem("MAC Address", (asset.macs || []).join(", ") || "Unknown")}
         ${detailItem("VLAN", (asset.vlans || []).join(", "))}
-        ${detailItem("역할", (asset.roles || []).join(", "))}
-        ${detailItem("관측 프로토콜", (asset.protocols || []).join(", "))}
+        ${detailItem("Roles", (asset.roles || []).join(", "))}
+        ${detailItem("Observed Protocols", (asset.protocols || []).join(", "))}
         ${vulnDetail(asset)}
         ${pointsDetail(asset)}
-        <div class="detail-item"><span>식별 근거</span>${evidence}</div>
-        <div class="detail-item"><span>통신 및 명령</span>${commsHtml}</div>
-        ${detailItem("패킷 / 바이트", `${asset.packets.toLocaleString()} / ${asset.bytes.toLocaleString()}`)}
-        <div class="detail-item"><span>최초 / 최근 관측</span><strong>${escapeHtml(formatTime(asset.first_seen))}<br>${escapeHtml(formatTime(asset.last_seen))}</strong></div>
-        ${asset.manual && asset.manual.updated_by ? detailItem("정보 수정", `${asset.manual.updated_by} · ${formatTime(asset.manual.updated_at)}`) : ""}
+        <div class="detail-item"><span>Identification Evidence</span>${evidence}</div>
+        <div class="detail-item"><span>Communications &amp; Commands</span>${commsHtml}</div>
+        ${detailItem("Packets / Bytes", `${asset.packets.toLocaleString()} / ${asset.bytes.toLocaleString()}`)}
+        <div class="detail-item"><span>First / Last Seen</span><strong>${escapeHtml(formatTime(asset.first_seen))}<br>${escapeHtml(formatTime(asset.last_seen))}</strong></div>
+        ${asset.manual && asset.manual.updated_by ? detailItem("Last Edited", `${asset.manual.updated_by} · ${formatTime(asset.manual.updated_at)}`) : ""}
       </div>
     </div>`);
 }
 
 const alertSource = document.getElementById("alert-source");
 const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
-const ROLE_LABEL = { viewer: "조회자", operator: "운영자", admin: "관리자" };
+const ROLE_LABEL = { viewer: "Viewer", operator: "Operator", admin: "Admin" };
 let currentUser = null;
 
 function can(role) {
   return currentUser && ROLE_RANK[currentUser.role] >= ROLE_RANK[role];
 }
 
-/** fetch wrapper: an expired or revoked session sends the user back to the login page. */
 async function api(url, options) {
   const response = await fetch(url, options);
   if (response.status === 401) {
@@ -417,7 +415,6 @@ async function api(url, options) {
 }
 const vulnLevel = document.getElementById("vuln-level");
 const vulnsBody = document.getElementById("vulns-body");
-const RISK_LABEL = { critical: "심각", high: "높음", medium: "보통", low: "낮음" };
 
 function vulnRows(assets) {
   const filter = vulnLevel.value;
@@ -444,13 +441,13 @@ function renderVulns(snapshot) {
   const state = snapshot.vulndb_state || {};
   const info = document.getElementById("vulndb-info");
   if (db) {
-    info.textContent = `CISA ICS 권고문 ${db.advisory_count.toLocaleString()}건 · KEV 카탈로그 ${db.sources?.kev_catalog_version || "-"} · DB 생성 ${formatTime(db.built_at)}`;
+    info.textContent = `${db.advisory_count.toLocaleString()} CISA ICS Advisories · KEV Catalog ${db.sources?.kev_catalog_version || "-"} · Built ${formatTime(db.built_at)}`;
   } else if (state.error) {
-    info.textContent = `취약점 DB 로드 실패: ${state.error}`;
+    info.textContent = `Failed to load Vulnerability DB: ${state.error}`;
   }
   const rows = vulnRows(snapshot.assets || []);
   if (rows.length === 0) {
-    setHtml(vulnsBody, `<tr><td colspan="7" class="empty-row">${db ? "조건에 맞는 취약점이 없습니다." : "취약점 DB를 업로드하면 자산 펌웨어와 자동 대조합니다."}</td></tr>`);
+    setHtml(vulnsBody, `<tr><td colspan="7" class="empty-row">${db ? "No matching vulnerabilities for the current filter." : "Upload vulndb.json to match discovered assets offline."}</td></tr>`);
     return;
   }
   setHtml(vulnsBody, rows.slice(0, 300).map(({ asset, v }) => `
@@ -459,8 +456,8 @@ function renderVulns(snapshot) {
       <td class="mono"><a data-id="${escapeHtml(asset.id)}">${escapeHtml(asset.label)}</a><small>${escapeHtml([asset.model, asset.firmware].filter(Boolean).join(" · "))}</small></td>
       <td>${advisoryLink(v)}${v.kev ? ' <span class="kev">KEV</span>' : ""}<small>${escapeHtml(v.title)}</small></td>
       <td>${escapeHtml(v.product)}<small>${escapeHtml(v.versions)}</small></td>
-      <td class="mono">${v.cvss ?? "-"}</td>
-      <td><span class="lvl lvl-${v.level}">${escapeHtml(v.level_label)}</span></td>
+      <td class="mono">${escapeHtml(v.cvss ?? "-")}</td>
+      <td><span class="lvl lvl-${escapeHtml(v.level)}">${escapeHtml(LEVEL_LABEL[v.level] || LEVEL_LABEL[v.level_label] || v.level_label)}</span></td>
       <td class="fix">${escapeHtml(v.remediation || "-")}</td>
     </tr>`).join(""));
 }
@@ -470,17 +467,18 @@ function renderBaseline(baseline) {
   const learning = baseline.mode === "learning";
   const bar = document.getElementById("baseline-bar");
   bar.className = `baseline-bar ${learning ? "mode-learning" : "mode-detecting"}`;
-  document.getElementById("mode-badge").textContent = learning ? "학습 중" : "탐지 중";
-  let title = learning ? "정상 통신 학습 중" : "베이스라인 이탈 탐지 중";
+  document.getElementById("mode-badge").textContent = learning ? "Learning" : "Detecting";
+  let title = learning ? "Learning Normal Traffic" : "Detecting Baseline Deviations";
   if (learning && baseline.learning_until) {
     const left = Math.max(0, baseline.learning_until * 1000 - Date.now());
     const hours = Math.floor(left / 3600000), minutes = Math.ceil((left % 3600000) / 60000);
-    title += ` · ${hours ? `${hours}시간 ` : ""}${minutes}분 후 탐지 모드로 자동 전환`;
+    title += ` · Auto-switches to Detection in ${hours ? `${hours}h ` : ""}${minutes}m`;
   }
   document.getElementById("mode-title").textContent = title;
+  const sinceStr = baseline.mode_since ? formatTime(new Date(baseline.mode_since * 1000).toISOString()) : "-";
   document.getElementById("mode-desc").textContent = learning
-    ? "관측되는 자산·통신·명령을 정상 베이스라인으로 기록합니다. 위험 명령 경고는 학습 중에도 발생합니다."
-    : `${formatTime(new Date(baseline.mode_since * 1000).toISOString())}부터 베이스라인에 없는 자산·통신·명령을 경고합니다.`;
+    ? "Observed assets, links, and commands are recorded as baseline behavior. Risky command policy alerts remain active."
+    : `Alerting on unseen assets, links, and commands since ${sinceStr}.`;
   const counts = baseline.counts || {};
   document.getElementById("bl-assets").textContent = (counts.asset ?? 0).toLocaleString();
   document.getElementById("bl-links").textContent = (counts.link ?? 0).toLocaleString();
@@ -497,7 +495,7 @@ async function setMode(mode, reset = false) {
   const response = await api("/api/baseline/mode", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  if (!response.ok) alert(`모드 변경 실패: ${response.status}`);
+  if (!response.ok) alert(`Failed to change baseline mode (${response.status})`);
   await loadSnapshot();
 }
 
@@ -518,26 +516,26 @@ function renderExternal(snapshot) {
   const all = snapshot.external || [];
   const flagged = all.filter((e) => e.score >= 30).length;
   document.getElementById("external-info").textContent =
-    `인터넷 주소 ${all.length.toLocaleString()}곳 · 주의 이상 ${flagged}곳 · `
-    + (intel.asn ? `조직 DB ${intel.asn.ranges.toLocaleString()} 범위` : "조직 DB 없음 (tools/ipasn_build.py)")
-    + " · " + (intel.blocklist ? `위협 목록 ${intel.blocklist.entries.toLocaleString()}건` : "위협 목록 없음 (tools/threatintel_build.py)");
+    `${all.length.toLocaleString()} External IPs · ${flagged} Flagged · `
+    + (intel.asn ? `ASN DB ${intel.asn.ranges.toLocaleString()} ranges` : "No ASN DB (tools/ipasn_build.py)")
+    + " · " + (intel.blocklist ? `Blocklist ${intel.blocklist.entries.toLocaleString()} entries` : "No Blocklist (tools/threatintel_build.py)");
   if (!rows.length) {
-    setHtml(externalBody, `<tr><td colspan="7" class="empty-row">${all.length ? "조건에 맞는 외부 통신이 없습니다." : "아직 인터넷 주소와의 통신이 관측되지 않았습니다."}</td></tr>`);
+    setHtml(externalBody, `<tr><td colspan="7" class="empty-row">${all.length ? "No external connections match this filter." : "No internet communications observed yet."}</td></tr>`);
     return;
   }
   setHtml(externalBody, rows.slice(0, 300).map((e) => {
     const [cls, label] = levelOf(e.score);
-    const org = e.org ? `<b>${escapeHtml(e.org.name)}</b>${e.org.well_known ? '<span class="well">잘 알려진</span>' : ""}
-        <small>AS${e.org.asn} · ${escapeHtml(e.org.country)}</small>` : '<span class="muted">조직 정보 없음</span>';
+    const org = e.org ? `<b>${escapeHtml(e.org.name)}</b>${e.org.well_known ? '<span class="well">Well-known</span>' : ""}
+        <small>AS${e.org.asn} · ${escapeHtml(e.org.country)}</small>` : '<span class="muted">Unknown org</span>';
     const names = e.domains.length ? `<small>${escapeHtml(e.domains.slice(-3).join(", "))}</small>` : "";
-    const services = e.services.map((s) => `<span class="svc ${s.inbound ? "in" : ""}" title="${s.inbound ? (s.accepted ? "인터넷에서 접속, 내부가 응답함" : "인터넷에서 접속 시도") : "내부에서 접속"}">
+    const services = e.services.map((s) => `<span class="svc ${s.inbound ? "in" : ""}" title="${s.inbound ? (s.accepted ? "Inbound connection accepted by internal host" : "Inbound connection attempt") : "Outbound connection"}">
         ${s.inbound ? "↘ " : ""}${s.port}/${s.tcp ? "TCP" : "UDP"}${s.name ? ` ${escapeHtml(s.name)}` : ""}</span>`).join("");
     const peers = e.peers.map((p) => `<a data-id="${escapeHtml(p)}">${escapeHtml(labelOf(p))}</a>`).join(", ")
-      + (e.peer_count > e.peers.length ? ` 외 ${e.peer_count - e.peers.length}` : "");
+      + (e.peer_count > e.peers.length ? ` +${e.peer_count - e.peers.length}` : "");
     return `<tr>
-      <td><span class="ext-level ${cls}" title="점수 ${e.score}">${label}</span>
+      <td><span class="ext-level ${cls}" title="Risk score ${e.score}">${label}</span>
         ${e.reasons.length ? `<small class="ext-reasons">${e.reasons.slice(0, 4).map(escapeHtml).join("<br>")}</small>` : ""}</td>
-      <td class="mono"><a data-id="${escapeHtml(e.id)}">${escapeHtml(e.ip)}</a>${e.threat ? ' <span class="kev">위협 목록</span>' : ""}</td>
+      <td class="mono"><a data-id="${escapeHtml(e.id)}">${escapeHtml(e.ip)}</a>${e.threat ? ' <span class="kev">Blocklist</span>' : ""}</td>
       <td class="ext-org">${org}${names}</td>
       <td class="mono">${peers}</td>
       <td>${services}</td>
@@ -551,36 +549,49 @@ function renderAlerts(alerts) {
   const source = alertSource.value;
   const rows = alerts.filter((a) => (showAcked.checked || a.status === "new") && (!source || a.source === source));
   if (rows.length === 0) {
-    setHtml(alertsBody, `<tr><td colspan="8" class="empty-row">표시할 경고가 없습니다.</td></tr>`);
+    setHtml(alertsBody, `<tr><td colspan="8" class="empty-row">No alerts to display.</td></tr>`);
     return;
   }
-  setHtml(alertsBody, rows.slice(0, 200).map((a) => `
+  setHtml(alertsBody, rows.slice(0, 200).map((a) => {
+    const cat = CATEGORY_LABEL[a.category] || a.category_label || "";
+    return `
     <tr class="${a.status === "acknowledged" ? "acked" : ""}">
-      <td><span class="sev sev-${a.severity}">${SEVERITY_LABEL[a.severity] || a.severity}</span></td>
-      <td><span class="src-tag src-${SOURCE_TAG[a.source] ? a.source : "policy"}">${SOURCE_TAG[a.source] || "정책"}</span></td>
-      <td><strong>${escapeHtml(a.title)}</strong>${a.category_label ? `<small>${escapeHtml(a.category_label)}</small>` : ""}</td>
+      <td><span class="sev sev-${escapeHtml(a.severity)}">${escapeHtml(SEVERITY_LABEL[a.severity] || a.severity)}</span></td>
+      <td><span class="src-tag src-${SOURCE_TAG[a.source] ? a.source : "policy"}">${SOURCE_TAG[a.source] || "Policy"}</span></td>
+      <td><strong>${escapeHtml(a.title)}</strong>${cat ? `<small>${escapeHtml(cat)}</small>` : ""}</td>
       <td class="mono"><a data-id="${escapeHtml(a.src)}">${escapeHtml(labelOf(a.src))}</a>${a.dst ? ` → <a data-id="${escapeHtml(a.dst)}">${escapeHtml(labelOf(a.dst))}</a>` : ""}</td>
       <td>${escapeHtml(a.protocol)}</td>
       <td class="mono">${a.count}</td>
       <td class="mono">${escapeHtml(formatTime(a.last_seen))}</td>
-      <td class="actions">${a.status !== "new" ? "확인됨" : !can("operator") ? "" :
-        `${a.baseline ? `<button class="ack learn" data-learn="${a.id}" title="이 동작을 정상으로 베이스라인에 추가">정상 등록</button>` : ""}<button class="ack" data-ack="${a.id}">확인</button>`}</td>
-    </tr>`).join(""));
+      <td class="actions">${a.status !== "new" ? "Acknowledged" : !can("operator") ? "" :
+        `${a.baseline ? `<button class="ack learn" data-learn="${a.id}" title="Add this behavior to the baseline">Learn</button>` : ""}<button class="ack" data-ack="${a.id}">Ack</button>`}</td>
+    </tr>`;
+  }).join(""));
 }
 
 document.addEventListener("click", async (event) => {
   const learn = event.target.closest("[data-learn]");
   if (learn) {
     learn.disabled = true;
-    await api(`/api/alerts/${learn.dataset.learn}/learn`, { method: "POST" });
-    await loadSnapshot();
+    try {
+      const res = await api(`/api/alerts/${learn.dataset.learn}/learn`, { method: "POST" });
+      if (!res.ok) learn.disabled = false;
+      await loadSnapshot();
+    } catch {
+      learn.disabled = false;
+    }
     return;
   }
   const ack = event.target.closest("[data-ack]");
   if (ack) {
     ack.disabled = true;
-    await api(`/api/alerts/${ack.dataset.ack}/ack`, { method: "POST" });
-    await loadSnapshot();
+    try {
+      const res = await api(`/api/alerts/${ack.dataset.ack}/ack`, { method: "POST" });
+      if (!res.ok) ack.disabled = false;
+      await loadSnapshot();
+    } catch {
+      ack.disabled = false;
+    }
     return;
   }
   const target = event.target.closest("[data-id]");
@@ -599,11 +610,11 @@ document.getElementById("vulndb-input").addEventListener("change", async (event)
   event.target.value = "";
   if (!file) return;
   const info = document.getElementById("vulndb-info");
-  info.textContent = `${file.name} 업로드 및 대조 중…`;
+  info.textContent = `Uploading & matching ${file.name}…`;
   const response = await api("/api/vulndb", { method: "POST", headers: { "Content-Type": "application/json" }, body: file });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
-    info.textContent = `업로드 실패: ${detail.detail || response.status}`;
+    info.textContent = `Upload failed: ${detail.detail || response.status}`;
     return;
   }
   await loadSnapshot();
@@ -611,7 +622,7 @@ document.getElementById("vulndb-input").addEventListener("change", async (event)
 document.getElementById("btn-detect").addEventListener("click", () => setMode("detecting"));
 document.getElementById("btn-learn").addEventListener("click", () => setMode("learning"));
 document.getElementById("btn-reset").addEventListener("click", () => {
-  if (confirm("베이스라인을 모두 지우고 처음부터 다시 학습할까요? 이후 관측되는 모든 통신이 정상으로 기록됩니다.")) {
+  if (confirm("Clear the entire baseline and restart learning from scratch? All subsequent observed traffic will be learned as normal.")) {
     setMode("learning", true);
   }
 });
@@ -621,7 +632,7 @@ document.getElementById("pcap-input").addEventListener("change", async (event) =
   event.target.value = "";
   if (!file) return;
   const status = document.getElementById("import-status");
-  status.textContent = `${file.name} 업로드 중…`;
+  status.textContent = `Uploading ${file.name}…`;
   status.className = "import-status running";
   const response = await api("/api/pcap", {
     method: "POST",
@@ -630,7 +641,7 @@ document.getElementById("pcap-input").addEventListener("change", async (event) =
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
-    status.textContent = `업로드 실패: ${detail.detail || response.status}`;
+    status.textContent = `Upload failed: ${detail.detail || response.status}`;
     status.className = "import-status error";
   }
 });
@@ -641,55 +652,237 @@ async function loadSnapshot() {
   render(await response.json());
 }
 
+let wsRetryDelay = 2000;
 function connect() {
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${scheme}//${location.host}/ws`);
-  socket.addEventListener("message", (event) => render(JSON.parse(event.data)));
-  // The server closes the feed on logout/expiry; the session probe then redirects to the login page.
-  socket.addEventListener("close", () => setTimeout(() => api("/api/session").then(connect, () => {}), 2000));
+  socket.addEventListener("open", () => { wsRetryDelay = 2000; });
+  socket.addEventListener("message", (event) => {
+    try { render(JSON.parse(event.data)); } catch {}
+  });
+  socket.addEventListener("close", () => {
+    setTimeout(() => {
+      api("/api/session").then(() => connect(), (err) => {
+        if (err && err.message === "session expired") return;
+        wsRetryDelay = Math.min(30000, Math.round(wsRetryDelay * 1.5));
+        connect();
+      });
+    }, wsRetryDelay);
+  });
   socket.addEventListener("error", () => socket.close());
 }
 
+// ------------------------------------------------------------ support menu & version/updates
+const supportBtn = document.getElementById("btn-support");
+const supportDropdown = document.getElementById("support-dropdown");
+function closeSupportMenu() {
+  supportDropdown.hidden = true;
+  supportBtn.setAttribute("aria-expanded", "false");
+}
+supportBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  const next = !supportDropdown.hidden;
+  supportDropdown.hidden = next;
+  supportBtn.setAttribute("aria-expanded", String(!next));
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#support-menu")) closeSupportMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeSupportMenu();
+});
+
+function syncSupportUrls(info) {
+  if (!info) return;
+  const setHref = (id, url) => {
+    const el = document.getElementById(id);
+    if (el && url && /^https:\/\//.test(url)) el.href = url;
+  };
+  setHref("link-github-issues", info.issues_url);
+  setHref("link-github-discussions", info.discussions_url);
+  setHref("link-github-releases", info.releases_url);
+  setHref("btn-panel-issues", info.issues_url);
+  setHref("btn-panel-discussions", info.discussions_url);
+  setHref("footer-issues", info.issues_url);
+  setHref("footer-discussions", info.discussions_url);
+  setHref("footer-releases", info.releases_url);
+}
+
+function renderVersionPill(info) {
+  if (!info) return;
+  const ver = info.version || info.current_version || "0.1.0";
+  const pill = document.getElementById("version-pill");
+  if (pill) {
+    pill.textContent = info.update_available && info.latest_version
+      ? `v${ver} → v${info.latest_version}`
+      : `v${ver}`;
+    pill.classList.toggle("has-update", Boolean(info.update_available));
+    pill.title = info.update_available
+      ? `Update available: v${info.latest_version}`
+      : `NetEye v${ver} (${info.platform}/${info.arch})`;
+    if (!can("admin") && info.releases_url && /^https:\/\//.test(info.releases_url)) {
+      pill.href = info.releases_url;
+      pill.target = "_blank";
+      pill.rel = "noopener noreferrer";
+    }
+  }
+  const footer = document.getElementById("footer-brand");
+  if (footer) footer.textContent = `NetEye v${ver} · Packet payloads are never stored.`;
+  syncSupportUrls(info);
+}
+
+function renderUpdatePanel(info) {
+  if (!info) return;
+  renderVersionPill(info);
+  document.getElementById("upd-current").textContent = `v${info.current_version}`;
+  document.getElementById("upd-latest").textContent = info.latest_version ? `v${info.latest_version}` : "Not checked";
+  document.getElementById("upd-platform").textContent = `${info.platform}/${info.arch}`;
+  document.getElementById("upd-checked").textContent = info.last_checked ? formatTime(info.last_checked) : "Never";
+
+  const summary = document.getElementById("update-summary");
+  summary.textContent = info.status_message
+    || `Repository: ${info.repo} · Checks GitHub Releases and verifies SHA-256 checksums before updating.`;
+
+  const statusEl = document.getElementById("update-status-msg");
+  statusEl.textContent = info.last_error || (info.restart_required ? "Update staged — restart NetEye service to activate." : "");
+  statusEl.className = `import-status ${info.last_error ? "error" : info.restart_required ? "running" : ""}`;
+
+  const applyBtn = document.getElementById("btn-apply-update");
+  applyBtn.hidden = !(info.update_available && info.asset_url);
+  applyBtn.disabled = Boolean(info.applying);
+  applyBtn.textContent = info.applying
+    ? "Downloading & Installing…"
+    : info.can_self_update ? `Install v${info.latest_version}` : `Download v${info.latest_version}`;
+
+  const relLink = document.getElementById("link-download-release");
+  if (info.release_url && /^https:\/\//.test(info.release_url)) {
+    relLink.href = info.release_url;
+    relLink.hidden = false;
+  } else {
+    relLink.hidden = true;
+  }
+
+  document.getElementById("opt-auto-check").checked = Boolean(info.auto_check);
+  const autoApply = document.getElementById("opt-auto-apply");
+  autoApply.checked = Boolean(info.auto_apply);
+  autoApply.disabled = !info.can_self_update;
+
+  const notes = document.getElementById("update-notes");
+  if (info.release_notes && info.release_notes.trim()) {
+    notes.textContent = info.release_notes;
+    notes.hidden = false;
+  } else {
+    notes.hidden = true;
+  }
+}
+
+async function loadVersion() {
+  const res = await api("/api/version");
+  if (res.ok) renderVersionPill(await res.json());
+}
+
+async function loadUpdateStatus() {
+  if (!can("admin")) return;
+  const res = await api("/api/update");
+  if (res.ok) renderUpdatePanel(await res.json());
+}
+
+document.getElementById("btn-check-update").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-check-update");
+  const statusEl = document.getElementById("update-status-msg");
+  btn.disabled = true;
+  statusEl.textContent = "Checking GitHub Releases…";
+  statusEl.className = "import-status running";
+  try {
+    const res = await api("/api/update/check", { method: "POST" });
+    if (res.ok) renderUpdatePanel(await res.json());
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("btn-apply-update").addEventListener("click", async () => {
+  if (!confirm("Download, verify SHA-256 checksum, and install the latest NetEye release?")) return;
+  const btn = document.getElementById("btn-apply-update");
+  const statusEl = document.getElementById("update-status-msg");
+  btn.disabled = true;
+  statusEl.textContent = "Downloading and verifying update…";
+  statusEl.className = "import-status running";
+  try {
+    const res = await api("/api/update/apply", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      statusEl.textContent = data.detail || `Update failed (${res.status})`;
+      statusEl.className = "import-status error";
+      btn.disabled = false;
+      return;
+    }
+    renderUpdatePanel(data);
+  } catch (err) {
+    statusEl.textContent = `Update failed: ${err.message}`;
+    statusEl.className = "import-status error";
+    btn.disabled = false;
+  }
+});
+
+async function saveUpdateSettings() {
+  const res = await api("/api/update/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      auto_check: document.getElementById("opt-auto-check").checked,
+      auto_apply: document.getElementById("opt-auto-apply").checked,
+    }),
+  });
+  if (res.ok) {
+    const data = await res.json();
+    renderUpdatePanel(data);
+    if (data.warning) alert(data.warning);
+  }
+}
+document.getElementById("opt-auto-check").addEventListener("change", saveUpdateSettings);
+document.getElementById("opt-auto-apply").addEventListener("change", saveUpdateSettings);
+
 // ------------------------------------------------------------ account
 function renderUsers(users) {
-  document.getElementById("users-body").innerHTML = users.map((u) => `
+  setHtml(document.getElementById("users-body"), users.map((u) => `
     <tr>
-      <td class="mono">${escapeHtml(u.username)}${u.username === currentUser.username ? " (나)" : ""}</td>
+      <td class="mono">${escapeHtml(u.username)}${u.username === currentUser.username ? " (you)" : ""}</td>
       <td><select data-user-role="${escapeHtml(u.username)}">
         ${Object.keys(ROLE_LABEL).map((r) => `<option value="${r}" ${r === u.role ? "selected" : ""}>${ROLE_LABEL[r]}</option>`).join("")}
       </select></td>
-      <td>${u.must_change ? "비밀번호 변경 대기" : "활성"}</td>
+      <td>${u.must_change ? "Password change required" : "Active"}</td>
       <td class="mono">${escapeHtml(formatTime(u.created))}</td>
       <td class="actions">
-        <button class="ack" data-user-reset="${escapeHtml(u.username)}">비밀번호 재설정</button>
-        ${u.username === currentUser.username ? "" : `<button class="ack" data-user-delete="${escapeHtml(u.username)}">삭제</button>`}
+        <button class="ack" data-user-reset="${escapeHtml(u.username)}">Reset Password</button>
+        ${u.username === currentUser.username ? "" : `<button class="ack" data-user-delete="${escapeHtml(u.username)}">Delete</button>`}
       </td>
-    </tr>`).join("");
+    </tr>`).join(""));
 }
 
 function renderAudit(rows) {
-  document.getElementById("audit-body").innerHTML = rows.length ? rows.map((r) => `
+  setHtml(document.getElementById("audit-body"), rows.length ? rows.map((r) => `
     <tr class="${r.status >= 400 ? "audit-fail" : ""}">
       <td class="mono">${escapeHtml(formatTime(r.ts))}</td>
       <td class="mono">${escapeHtml(r.username)}</td>
       <td class="mono">${escapeHtml(r.ip)}</td>
       <td>${escapeHtml(r.action)}${r.detail ? `<small>${escapeHtml(r.detail)}</small>` : ""}</td>
       <td class="mono">${r.status}</td>
-    </tr>`).join("") : '<tr><td colspan="5" class="empty-row">기록이 없습니다.</td></tr>';
+    </tr>`).join("") : '<tr><td colspan="5" class="empty-row">No audit entries yet.</td></tr>');
 }
 
 function renderSiem(info) {
   const el = document.getElementById("siem-status");
   const syslog = info && info.syslog;
   if (!syslog) {
-    el.innerHTML = '<strong>SIEM 연동</strong><span>설정 안 됨 — NETEYE_SYSLOG=udp://host:514,tcp://host:601 로 경고·감사 로그를 syslog(CEF/JSON)로 전송합니다.</span>';
+    setHtml(el, '<strong>SIEM Integration</strong><span>Not configured — set NETEYE_SYSLOG=udp://host:514,tcp://host:601 to forward alerts and audit logs as syslog (CEF/JSON).</span>');
     return;
   }
-  el.innerHTML = `<strong>SIEM 연동 · ${escapeHtml(syslog.format.toUpperCase())}</strong>` + syslog.destinations.map((d) => {
-    const state = d.transport === "udp" ? "UDP (전달 확인 없음)" : d.connected ? "연결됨" : "연결 끊김";
+  setHtml(el, `<strong>SIEM Integration · ${escapeHtml(syslog.format.toUpperCase())}</strong>` + syslog.destinations.map((d) => {
+    const state = d.transport === "udp" ? "UDP (unacknowledged)" : d.connected ? "Connected" : "Disconnected";
     const cls = d.transport === "udp" ? "" : d.connected ? "ok" : "bad";
-    return `<span class="siem-dest ${cls}"><b class="mono">${escapeHtml(d.url)}</b> ${state} · 전송 ${d.sent.toLocaleString()} · 대기 ${d.queued}${d.dropped ? ` · 유실 ${d.dropped}` : ""}${d.last_error ? ` · ${escapeHtml(d.last_error)}` : ""}</span>`;
-  }).join("");
+    return `<span class="siem-dest ${cls}"><b class="mono">${escapeHtml(d.url)}</b> ${state} · Sent ${d.sent.toLocaleString()} · Queued ${d.queued}${d.dropped ? ` · Dropped ${d.dropped}` : ""}${d.last_error ? ` · ${escapeHtml(d.last_error)}` : ""}</span>`;
+  }).join(""));
 }
 
 let captureChoicesLoaded = false;
@@ -700,16 +893,16 @@ async function loadCaptureSettings() {
   const data = await response.json();
   const select = document.getElementById("capture-interface-select");
   const current = data.sensor && data.sensor.interface;
-  const options = [`<option value="">수집 안 함 (PCAP 분석만)</option>`].concat(data.interfaces.map((d) =>
+  const options = [`<option value="">Disabled (PCAP analysis only)</option>`].concat(data.interfaces.map((d) =>
     `<option value="${escapeHtml(d.name)}" ${d.name === current ? "selected" : ""}>${escapeHtml(d.description || d.name)}</option>`));
   if (!captureChoicesLoaded || !select.matches(":focus")) {
     select.innerHTML = options.join("");
     captureChoicesLoaded = true;
   }
   const status = document.getElementById("capture-form-status");
-  status.textContent = data.error ? `수집 드라이버: ${data.error}`
-    : `${data.sensor.enabled ? "수집 중" : current ? "시작 중 또는 오류" : "수집 꺼짐"}${data.sensor.error ? ` · ${data.sensor.error}` : ""}`
-      + (data.config_file ? ` · 설정 파일 ${data.config_file}` : "");
+  status.textContent = data.error ? `Capture driver: ${data.error}`
+    : `${data.sensor.enabled ? "Capturing" : current ? "Starting or error" : "Capture off"}${data.sensor.error ? ` · ${data.sensor.error}` : ""}`
+      + (data.config_file ? ` · Config ${data.config_file}` : "");
   status.className = `import-status ${data.error || data.sensor.error ? "error" : ""}`;
 }
 
@@ -721,7 +914,7 @@ document.getElementById("capture-form").addEventListener("submit", async (event)
     body: JSON.stringify({ interface: select.value || null }),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) alert(data.detail || `적용 실패 (${response.status})`);
+  if (!response.ok) alert(data.detail || `Failed to apply capture interface (${response.status})`);
   else if (data.warning) alert(data.warning);
   setTimeout(loadCaptureSettings, 1500);
 });
@@ -729,6 +922,7 @@ document.getElementById("capture-form").addEventListener("submit", async (event)
 async function loadAdmin() {
   if (!can("admin")) return;
   loadCaptureSettings();
+  loadUpdateStatus();
   const [users, audit, integrations] = await Promise.all([api("/api/users"), api("/api/audit?limit=100"), api("/api/integrations")]);
   if (users.ok) renderUsers(await users.json());
   if (audit.ok) renderAudit(await audit.json());
@@ -740,7 +934,7 @@ async function adminRequest(url, method, body) {
     method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined,
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) alert(data.detail || `요청 실패 (${response.status})`);
+  if (!response.ok) alert(data.detail || `Request failed (${response.status})`);
   await loadAdmin();
   return response.ok;
 }
@@ -755,7 +949,7 @@ document.getElementById("user-form").addEventListener("submit", async (event) =>
   });
   if (ok) {
     event.target.reset();
-    status.textContent = "추가됨 — 첫 로그인 때 비밀번호를 변경해야 합니다";
+    status.textContent = "User added — password change required on first sign-in";
   }
 });
 
@@ -767,11 +961,11 @@ document.addEventListener("change", (event) => {
 document.addEventListener("click", (event) => {
   const reset = event.target.closest("[data-user-reset]");
   if (reset) {
-    const password = prompt(`${reset.dataset.userReset}의 임시 비밀번호 (10자 이상). 다음 로그인 때 변경해야 합니다.`);
+    const password = prompt(`Temporary password for ${reset.dataset.userReset} (10+ characters). Must be changed on next sign-in.`);
     if (password) adminRequest(`/api/users/${encodeURIComponent(reset.dataset.userReset)}`, "POST", { password });
   }
   const del = event.target.closest("[data-user-delete]");
-  if (del && confirm(`${del.dataset.userDelete} 사용자를 삭제할까요? 열려 있는 세션도 즉시 종료됩니다.`)) {
+  if (del && confirm(`Delete user ${del.dataset.userDelete}? Active sessions will be terminated immediately.`)) {
     adminRequest(`/api/users/${encodeURIComponent(del.dataset.userDelete)}`, "DELETE");
   }
 });
@@ -786,7 +980,6 @@ function openAssetEditor(id) {
   if (!asset) return;
   editingAsset = asset;
   const manual = asset.manual || {};
-  // Placeholders show what was identified automatically (the value used when the field is empty).
   const auto = asset.auto || { device_type: asset.device_type, vendor: asset.vendor, model: asset.model,
     firmware: asset.firmware, os: asset.os };
   const autoName = asset.hostname || asset.label;
@@ -795,12 +988,12 @@ function openAssetEditor(id) {
     input.value = manual[field] || "";
     if (input.tagName !== "SELECT" && field !== "notes") {
       const hint = field === "name" ? autoName : auto[field];
-      input.placeholder = hint && hint !== "Unknown" ? `자동: ${hint}` : field === "name" ? "예: 보일러 #2 제어 PLC" : "";
+      input.placeholder = hint && hint !== "Unknown" ? `Auto: ${hint}` : field === "name" ? "e.g. Boiler #2 Main PLC" : "";
     }
   });
   document.getElementById("asset-dialog-id").textContent = asset.label;
   document.getElementById("asset-dialog-meta").textContent = manual.updated_by
-    ? `마지막 수정: ${manual.updated_by} · ${formatTime(manual.updated_at)}` : "";
+    ? `Last edited by ${manual.updated_by} · ${formatTime(manual.updated_at)}` : "";
   document.getElementById("asset-error").hidden = true;
   assetDialog.showModal();
   assetForm.elements.name.focus();
@@ -813,7 +1006,7 @@ async function saveAsset(values) {
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    error.textContent = `저장 실패: ${data.detail || response.status}`;
+    error.textContent = `Save failed: ${data.detail || response.status}`;
     error.hidden = false;
     return;
   }
@@ -832,7 +1025,7 @@ assetForm.addEventListener("submit", (event) => {
 });
 document.getElementById("asset-cancel").addEventListener("click", () => assetDialog.close());
 document.getElementById("asset-clear").addEventListener("click", () => {
-  if (confirm("이 자산에 입력한 정보를 모두 지우고 자동 식별 값으로 되돌릴까요?")) saveAsset({});
+  if (confirm("Clear all manually entered values for this asset and revert to auto-detected values?")) saveAsset({});
 });
 
 document.getElementById("btn-logout").addEventListener("click", async () => {
@@ -852,7 +1045,7 @@ document.getElementById("password-form").addEventListener("submit", async (event
   const error = document.getElementById("pw-error");
   const next = document.getElementById("pw-new").value;
   if (next !== document.getElementById("pw-confirm").value) {
-    error.textContent = "새 비밀번호가 서로 다릅니다.";
+    error.textContent = "New passwords do not match.";
     error.hidden = false;
     return;
   }
@@ -862,12 +1055,12 @@ document.getElementById("password-form").addEventListener("submit", async (event
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    error.textContent = data.detail || `변경 실패 (${response.status})`;
+    error.textContent = data.detail || `Password change failed (${response.status})`;
     error.hidden = false;
     return;
   }
   passwordDialog.close();
-  alert("비밀번호를 변경했습니다. 다른 기기의 로그인은 종료됩니다.");
+  alert("Password updated. Other active sessions have been signed out.");
 });
 
 async function start() {
@@ -879,8 +1072,9 @@ async function start() {
   }
   document.body.dataset.role = currentUser.role;
   document.getElementById("user-badge").textContent = `${currentUser.username} · ${ROLE_LABEL[currentUser.role]}`;
+  loadVersion().catch(() => {});
   await loadSnapshot().catch((error) => {
-    document.getElementById("capture-interface").textContent = `서버 연결 오류: ${error.message}`;
+    document.getElementById("capture-interface").textContent = `Server connection error: ${error.message}`;
   });
   connect();
   if (can("admin")) {

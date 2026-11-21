@@ -18,9 +18,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
-ureq = { version = "3.5.2", default-features = false, features = ["json"] }
+ureq = { version = "3.5.2", default-features = false, features = ["json", "rustls"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ureq = { version = "3.5.2", default-features = false, features = ["platform-verifier"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2.191"
 
 [target."cfg(windows)".dependencies]

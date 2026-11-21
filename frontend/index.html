@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,20 +10,42 @@
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="/" aria-label="NetEye 홈">
-        <span class="brand-mark">N</span>
-        <span>NETEYE <small>OT VISIBILITY</small></span>
-      </a>
+      <div class="topbar-left">
+        <a class="brand" href="/" aria-label="NetEye Home">
+          <span class="brand-mark">N</span>
+          <span>NETEYE <small>OT VISIBILITY</small></span>
+        </a>
+        <a id="version-pill" class="version-pill" href="#updates-panel" title="Version &amp; Software Updates">v0.1.0</a>
+      </div>
       <div class="topbar-right">
         <span id="sensor-status" class="status-pill status-offline">
           <span class="status-dot"></span>
-          센서 연결 대기
+          Connecting to Sensor
         </span>
-        <span class="topbar-label">수동 모니터링</span>
+        <span class="topbar-label">Passive Monitoring</span>
+        <div class="support-menu" id="support-menu">
+          <button id="btn-support" class="link-button support-trigger" type="button" aria-expanded="false" aria-haspopup="menu">
+            Support ▾
+          </button>
+          <div id="support-dropdown" class="support-dropdown" role="menu" hidden>
+            <a id="link-github-issues" role="menuitem" href="https://github.com/knoxxr/NetEye/issues/new/choose" target="_blank" rel="noopener noreferrer">
+              <strong>GitHub Issues</strong>
+              <small>Report a bug or request a feature</small>
+            </a>
+            <a id="link-github-discussions" role="menuitem" href="https://github.com/knoxxr/NetEye/discussions" target="_blank" rel="noopener noreferrer">
+              <strong>GitHub Discussions</strong>
+              <small>Ask questions &amp; community Q&amp;A</small>
+            </a>
+            <a id="link-github-releases" role="menuitem" href="https://github.com/knoxxr/NetEye/releases" target="_blank" rel="noopener noreferrer">
+              <strong>Releases &amp; Changelog</strong>
+              <small>Download installers &amp; release notes</small>
+            </a>
+          </div>
+        </div>
         <div class="user-menu">
           <span id="user-badge" class="user-badge"></span>
-          <button id="btn-password" class="link-button" type="button">비밀번호 변경</button>
-          <button id="btn-logout" class="link-button" type="button">로그아웃</button>
+          <button id="btn-password" class="link-button" type="button">Password</button>
+          <button id="btn-logout" class="link-button" type="button">Sign Out</button>
         </div>
       </div>
     </header>
@@ -32,70 +54,70 @@
       <section class="page-heading">
         <div>
           <p class="eyebrow">NETWORK OVERVIEW</p>
-          <h1>자산 토폴로지</h1>
-          <p class="subtitle">관측된 OT 자산과 네트워크 통신 관계를 실시간으로 확인합니다.</p>
+          <h1>Asset Topology</h1>
+          <p class="subtitle">Monitor discovered OT/ICS assets, industrial protocol flows, and anomalies in real time.</p>
         </div>
         <div class="heading-actions">
           <span id="import-status" class="import-status"></span>
-          <label class="button" data-min-role="operator" title="pcap / pcapng 파일을 분석합니다">
+          <label class="button" data-min-role="operator" title="Analyze a pcap or pcapng capture file">
             <input id="pcap-input" type="file" accept=".pcap,.pcapng,.cap" hidden>
-            PCAP 분석
+            Analyze PCAP
           </label>
-          <div class="updated-label"><span class="pulse"></span> 실시간 업데이트</div>
+          <div class="updated-label"><span class="pulse"></span> Live Updates</div>
         </div>
       </section>
 
-      <section id="baseline-bar" class="baseline-bar mode-learning" aria-label="베이스라인 모드">
+      <section id="baseline-bar" class="baseline-bar mode-learning" aria-label="Baseline Mode">
         <div class="baseline-state">
-          <span class="mode-badge" id="mode-badge">학습 중</span>
+          <span class="mode-badge" id="mode-badge">Learning</span>
           <div>
-            <strong id="mode-title">정상 통신 학습 중</strong>
-            <p id="mode-desc">관측되는 자산·통신·명령을 정상 베이스라인으로 기록합니다. 위험 명령 경고는 학습 중에도 발생합니다.</p>
+            <strong id="mode-title">Learning Normal Traffic</strong>
+            <p id="mode-desc">Observed assets, links, and commands are recorded as baseline behavior. Risky command policy alerts remain active.</p>
           </div>
         </div>
         <div class="baseline-counts">
-          <span><b id="bl-assets">0</b> 자산</span>
-          <span><b id="bl-links">0</b> 통신</span>
-          <span><b id="bl-ops">0</b> 명령</span>
+          <span><b id="bl-assets">0</b> Assets</span>
+          <span><b id="bl-links">0</b> Links</span>
+          <span><b id="bl-ops">0</b> Commands</span>
         </div>
         <div class="baseline-actions" data-min-role="admin">
-          <button id="btn-detect" class="button">탐지 모드 시작</button>
-          <select id="learn-hours" aria-label="학습 기간">
-            <option value="">기간: 수동 종료</option>
-            <option value="1">1시간</option>
-            <option value="24">24시간</option>
-            <option value="168">7일</option>
+          <button id="btn-detect" class="button">Start Detection</button>
+          <select id="learn-hours" aria-label="Learning window">
+            <option value="">Window: Manual</option>
+            <option value="1">1 hour</option>
+            <option value="24">24 hours</option>
+            <option value="168">7 days</option>
           </select>
-          <button id="btn-learn" class="button ghost">학습 재개</button>
-          <button id="btn-reset" class="button danger" title="베이스라인을 비우고 처음부터 학습">초기화 후 재학습</button>
+          <button id="btn-learn" class="button ghost">Resume Learning</button>
+          <button id="btn-reset" class="button danger" title="Clear baseline and relearn from scratch">Reset &amp; Relearn</button>
         </div>
       </section>
 
-      <section class="stat-grid" aria-label="네트워크 요약">
+      <section class="stat-grid" aria-label="Network Summary">
         <article class="stat-card">
-          <span class="stat-label">관측 자산</span>
+          <span class="stat-label">Observed Assets</span>
           <strong id="stat-assets">0</strong>
-          <span class="stat-foot">네트워크에서 발견됨</span>
+          <span class="stat-foot">Discovered on network</span>
         </article>
         <article class="stat-card accent-card">
-          <span class="stat-label">식별된 OT 자산</span>
+          <span class="stat-label">Identified OT Assets</span>
           <strong id="stat-ot-assets">0</strong>
-          <span class="stat-foot">프로토콜 근거 기반 추정</span>
+          <span class="stat-foot">Protocol-verified devices</span>
         </article>
         <article class="stat-card">
-          <span class="stat-label">통신 관계</span>
+          <span class="stat-label">Communications</span>
           <strong id="stat-links">0</strong>
-          <span class="stat-foot">클라이언트 → 서버</span>
+          <span class="stat-foot">Client → Server links</span>
         </article>
         <article class="stat-card vuln-card">
-          <span class="stat-label">취약 자산</span>
+          <span class="stat-label">Vulnerable Assets</span>
           <strong id="stat-vuln">0</strong>
-          <span class="stat-foot">KEV(악용 중) <span id="stat-kev">0</span>대</span>
+          <span class="stat-foot"><span id="stat-kev">0</span> with CISA KEV</span>
         </article>
         <article class="stat-card alert-card">
-          <span class="stat-label">미확인 경고</span>
+          <span class="stat-label">Open Alerts</span>
           <strong id="stat-alerts">0</strong>
-          <span class="stat-foot"><span id="stat-alerts-high">0</span>건 높음/심각</span>
+          <span class="stat-foot"><span id="stat-alerts-high">0</span> High / Critical</span>
         </article>
       </section>
 
@@ -103,75 +125,75 @@
         <div class="graph-panel">
           <div class="panel-heading">
             <div>
-              <h2>네트워크 맵</h2>
-              <p>노드를 선택하면 자산 식별 정보와 관측 근거를 확인할 수 있습니다.</p>
+              <h2>Network Map</h2>
+              <p>Select any node to inspect device identity, protocol evidence, and vulnerabilities.</p>
             </div>
             <label class="search-box">
               <span aria-hidden="true">⌕</span>
-              <input id="asset-search" type="search" placeholder="IP, 벤더, 모델, 유형 검색" autocomplete="off">
+              <input id="asset-search" type="search" placeholder="Search IP, vendor, model, type" autocomplete="off">
             </label>
           </div>
-          <div class="graph-options" role="group" aria-label="네트워크 맵 보기 옵션">
-            <label>배치
+          <div class="graph-options" role="group" aria-label="Network map options">
+            <label>Layout
               <select id="graph-mode">
-                <option value="group">서브넷 그룹</option>
-                <option value="purdue">Purdue 계층</option>
-                <option value="free">자유 배치</option>
+                <option value="group">Subnet Groups</option>
+                <option value="purdue">Purdue Model</option>
+                <option value="free">Force Directed</option>
               </select>
             </label>
-            <label><input type="checkbox" id="graph-external"> 외부 IP 묶기</label>
-            <label><input type="checkbox" id="graph-isolated"> 통신 없는 자산 숨기기</label>
+            <label><input type="checkbox" id="graph-external"> Group External IPs</label>
+            <label><input type="checkbox" id="graph-isolated"> Hide Isolated Assets</label>
           </div>
           <div class="graph-wrap">
-            <canvas id="topology" role="img" aria-label="자산 통신 관계 그래프. 휠로 확대·축소, 드래그로 이동"></canvas>
+            <canvas id="topology" role="img" aria-label="Asset communication graph. Scroll to zoom, drag to pan."></canvas>
             <div class="graph-tooltip" hidden></div>
-            <div class="graph-controls" role="toolbar" aria-label="네트워크 맵 보기">
-              <button type="button" id="zoom-in" title="확대" aria-label="확대">+</button>
-              <button type="button" id="zoom-out" title="축소" aria-label="축소">−</button>
-              <button type="button" id="zoom-fit" title="전체 보기 (빈 곳 더블클릭)" aria-label="전체 보기">⤢</button>
-              <button type="button" id="flow-toggle" title="패킷 흐름 표시" aria-pressed="true">패킷</button>
-              <button type="button" id="graph-fullscreen" title="전체 화면 (Esc로 종료)" aria-label="전체 화면">⛶</button>
+            <div class="graph-controls" role="toolbar" aria-label="Network map controls">
+              <button type="button" id="zoom-in" title="Zoom In" aria-label="Zoom In">+</button>
+              <button type="button" id="zoom-out" title="Zoom Out" aria-label="Zoom Out">−</button>
+              <button type="button" id="zoom-fit" title="Fit to View (double-click background)" aria-label="Fit to View">⤢</button>
+              <button type="button" id="flow-toggle" title="Toggle packet flow animation" aria-pressed="true">Flow</button>
+              <button type="button" id="graph-fullscreen" title="Fullscreen (Esc to exit)" aria-label="Fullscreen">⛶</button>
             </div>
             <div id="empty-state" class="empty-state">
               <div class="empty-icon">⌁</div>
-              <strong>아직 관측된 자산이 없습니다</strong>
-              <span>미러링 인터페이스를 설정하면 패킷에서 자산과 연결을 자동으로 표시합니다.</span>
+              <strong>No assets observed yet</strong>
+              <span>Configure a SPAN/TAP capture interface or upload a PCAP file to map assets and communications.</span>
             </div>
           </div>
           <div class="legend">
             <span><i class="legend-dot plc"></i> PLC</span>
             <span><i class="legend-dot power"></i> RTU/IED</span>
             <span><i class="legend-dot workstation"></i> EWS/HMI</span>
-            <span><i class="legend-dot industrial"></i> 기타 OT 장비</span>
-            <span><i class="legend-dot unknown"></i> 미확인</span>
-            <span><i class="legend-line"></i> 관측된 통신</span>
-            <span class="legend-heat" title="통신선 색과 굵기: 초당 패킷 수">트래픽
-              <i style="background:#6f8fc0"></i>1 미만
+            <span><i class="legend-dot industrial"></i> Other OT</span>
+            <span><i class="legend-dot unknown"></i> Unknown</span>
+            <span><i class="legend-line"></i> Observed Link</span>
+            <span class="legend-heat" title="Edge color and thickness indicate packets per second">Traffic
+              <i style="background:#6f8fc0"></i>&lt;1
               <i style="background:#45d6cb"></i>1–10
               <i style="background:#f2d06b"></i>10–100
               <i style="background:#ff9f5a"></i>100+ pkt/s</span>
-            <span>노드 크기 = 누적 패킷</span>
-            <span><i class="legend-packet req"></i> 요청 패킷</span>
-            <span><i class="legend-packet resp"></i> 응답·보고 패킷</span>
-            <span class="legend-hint">휠: 확대/축소 · 드래그: 이동 · 노드 드래그: 고정 · 노드 더블클릭: 고정 해제</span>
+            <span>Node size = total packets</span>
+            <span><i class="legend-packet req"></i> Request</span>
+            <span><i class="legend-packet resp"></i> Response</span>
+            <span class="legend-hint">Wheel: zoom · Drag: pan · Drag node: pin · Double-click node: unpin</span>
           </div>
         </div>
 
         <aside class="details-panel">
           <div class="panel-heading detail-heading">
             <div>
-              <h2>자산 정보</h2>
-              <p>네트워크에서 확인된 장비</p>
+              <h2>Asset Inventory</h2>
+              <p>Devices observed on the network</p>
             </div>
             <span id="asset-count-badge" class="count-badge">0</span>
           </div>
           <div id="asset-list" class="asset-list">
-            <div class="list-placeholder">자산이 관측되면 여기에 표시됩니다.</div>
+            <div class="list-placeholder">Discovered assets will appear here.</div>
           </div>
           <div id="asset-detail" class="asset-detail">
             <div class="detail-placeholder">
               <span class="detail-placeholder-icon">◎</span>
-              <span>그래프 또는 목록에서 자산을 선택하세요.</span>
+              <span>Select an asset from the map or list.</span>
             </div>
           </div>
         </aside>
@@ -180,25 +202,25 @@
       <section class="alerts-panel vuln-panel">
         <div class="panel-heading">
           <div>
-            <h2>취약점</h2>
-            <p id="vulndb-info">취약점 DB가 없습니다. 인터넷 PC에서 <code>python tools/vulndb_build.py --fetch</code>로 만든 vulndb.json을 업로드하세요.</p>
+            <h2>Vulnerabilities</h2>
+            <p id="vulndb-info">No vulnerability DB loaded. Build <code>vulndb.json</code> with <code>python tools/vulndb_build.py --fetch</code> and upload it here.</p>
           </div>
           <div class="alert-filters">
-            <select id="vuln-level" aria-label="매칭 수준">
-              <option value="solid">확정·유력</option>
-              <option value="">전체(가능 포함)</option>
-              <option value="kev">KEV만</option>
+            <select id="vuln-level" aria-label="Match confidence filter">
+              <option value="solid">Confirmed &amp; Likely</option>
+              <option value="">All (incl. Possible)</option>
+              <option value="kev">KEV Only</option>
             </select>
-            <label class="button ghost" data-min-role="admin" title="tools/vulndb_build.py로 만든 vulndb.json">
+            <label class="button ghost" data-min-role="admin" title="Upload vulndb.json generated by tools/vulndb_build.py">
               <input id="vulndb-input" type="file" accept=".json" hidden>
-              취약점 DB 업로드
+              Upload Vuln DB
             </label>
           </div>
         </div>
         <div class="table-wrap">
           <table class="alerts-table">
             <thead>
-              <tr><th>위험</th><th>자산</th><th>권고문</th><th>대상 제품 / 영향 버전</th><th>CVSS</th><th>매칭</th><th>조치</th></tr>
+              <tr><th>Risk</th><th>Asset</th><th>Advisory</th><th>Product / Affected Versions</th><th>CVSS</th><th>Match</th><th>Remediation</th></tr>
             </thead>
             <tbody id="vulns-body"></tbody>
           </table>
@@ -208,21 +230,21 @@
       <section class="alerts-panel external-panel">
         <div class="panel-heading">
           <div>
-            <h2>외부 통신</h2>
-            <p id="external-info">인터넷 주소와의 통신을 상대 조직·도메인과 함께 보여 주고, 의심스러운 연결을 위로 올립니다.</p>
+            <h2>External Communications</h2>
+            <p id="external-info">Tracks internet traffic with AS organization &amp; domain attribution, ranking suspicious connections first.</p>
           </div>
           <div class="alert-filters">
-            <select id="external-filter" aria-label="외부 통신 필터">
-              <option value="flagged">주의 이상</option>
-              <option value="">전체</option>
-              <option value="unknown">잘 알려진 조직 제외</option>
+            <select id="external-filter" aria-label="External communication filter">
+              <option value="flagged">Warning &amp; Above</option>
+              <option value="">All</option>
+              <option value="unknown">Exclude Well-Known Orgs</option>
             </select>
           </div>
         </div>
         <div class="table-wrap">
           <table class="alerts-table external-table">
             <thead>
-              <tr><th>판단</th><th>외부 주소</th><th>조직 · 도메인</th><th>내부 상대</th><th>서비스</th><th>패킷 (나감/들어옴)</th><th>최근</th></tr>
+              <tr><th>Rating</th><th>External IP</th><th>Organization · Domain</th><th>Internal Peer</th><th>Service</th><th>Packets (Out/In)</th><th>Last Seen</th></tr>
             </thead>
             <tbody id="external-body"></tbody>
           </table>
@@ -232,24 +254,24 @@
       <section class="alerts-panel">
         <div class="panel-heading">
           <div>
-            <h2>보안 경고</h2>
-            <p>위험 명령(정책)과 베이스라인 이탈(신규 자산·통신·명령)을 탐지합니다. 정상인 이탈은 “정상 등록”으로 베이스라인에 추가하세요.</p>
+            <h2>Security Alerts</h2>
+            <p>Detects risky industrial commands (Policy), baseline deviations, statistical/process anomalies, and risky external links.</p>
           </div>
           <div class="alert-filters">
-            <select id="alert-source" aria-label="경고 유형">
-              <option value="">전체 유형</option>
-              <option value="policy">위험 명령</option>
-              <option value="baseline">베이스라인 이탈</option>
-              <option value="anomaly">통계 이상</option>
-              <option value="external">외부 통신</option>
+            <select id="alert-source" aria-label="Alert source filter">
+              <option value="">All Sources</option>
+              <option value="policy">Policy</option>
+              <option value="baseline">Baseline</option>
+              <option value="anomaly">Anomaly</option>
+              <option value="external">External</option>
             </select>
-            <label class="toggle"><input id="show-acked" type="checkbox"> 확인된 경고 표시</label>
+            <label class="toggle"><input id="show-acked" type="checkbox"> Show Acknowledged</label>
           </div>
         </div>
         <div class="table-wrap">
           <table class="alerts-table">
             <thead>
-              <tr><th>심각도</th><th>유형</th><th>경고</th><th>출발지 → 목적지</th><th>프로토콜</th><th>횟수</th><th>최근 발생</th><th></th></tr>
+              <tr><th>Severity</th><th>Source</th><th>Alert</th><th>Source → Destination</th><th>Protocol</th><th>Count</th><th>Last Seen</th><th></th></tr>
             </thead>
             <tbody id="alerts-body"></tbody>
           </table>
@@ -259,45 +281,75 @@
       <section class="alerts-panel admin-panel" data-min-role="admin">
         <div class="panel-heading">
           <div>
-            <h2>패킷 수집 설정</h2>
-            <p>미러링(SPAN) 포트에 연결된 랜카드를 고르면 바로 수집을 시작하고, 설정 파일에 저장해 다음 시작 때도 씁니다.</p>
+            <h2>Packet Capture Settings</h2>
+            <p>Select the network interface connected to a switch mirror (SPAN/TAP) port. Saved to the config file for future restarts.</p>
           </div>
         </div>
         <form id="capture-form" class="user-form">
-          <select id="capture-interface-select" aria-label="수집 인터페이스"><option value="">불러오는 중…</option></select>
-          <button class="button" type="submit">적용</button>
+          <select id="capture-interface-select" aria-label="Capture interface"><option value="">Loading…</option></select>
+          <button class="button" type="submit">Apply</button>
           <span id="capture-form-status" class="import-status"></span>
         </form>
+      </section>
+
+      <section id="updates-panel" class="alerts-panel admin-panel update-panel" data-min-role="admin">
+        <div class="panel-heading">
+          <div>
+            <h2>Version &amp; Auto-Update</h2>
+            <p id="update-summary">Checking installed version and GitHub Releases status…</p>
+          </div>
+          <div class="alert-filters">
+            <a id="btn-panel-issues" class="button ghost" href="https://github.com/knoxxr/NetEye/issues/new/choose" target="_blank" rel="noopener noreferrer">GitHub Issues</a>
+            <a id="btn-panel-discussions" class="button ghost" href="https://github.com/knoxxr/NetEye/discussions" target="_blank" rel="noopener noreferrer">GitHub Discussions</a>
+          </div>
+        </div>
+        <div class="update-body">
+          <div class="update-meta">
+            <span class="update-kv"><span>Installed</span><strong id="upd-current" class="mono">v0.1.0</strong></span>
+            <span class="update-kv"><span>Latest Release</span><strong id="upd-latest" class="mono">-</strong></span>
+            <span class="update-kv"><span>Platform</span><strong id="upd-platform" class="mono">-</strong></span>
+            <span class="update-kv"><span>Last Checked</span><strong id="upd-checked" class="mono">Never</strong></span>
+          </div>
+          <div class="update-actions">
+            <button id="btn-check-update" class="button" type="button">Check for Updates</button>
+            <button id="btn-apply-update" class="button primary-inline" type="button" hidden>Download &amp; Install Update</button>
+            <a id="link-download-release" class="button ghost" href="https://github.com/knoxxr/NetEye/releases" target="_blank" rel="noopener noreferrer" hidden>Open Release Page</a>
+            <label class="toggle"><input id="opt-auto-check" type="checkbox"> Auto-check daily</label>
+            <label class="toggle"><input id="opt-auto-apply" type="checkbox"> Auto-install verified updates</label>
+            <span id="update-status-msg" class="import-status"></span>
+          </div>
+          <pre id="update-notes" class="update-notes" hidden></pre>
+        </div>
       </section>
 
       <section class="alerts-panel admin-panel" data-min-role="admin">
         <div class="panel-heading">
           <div>
-            <h2>사용자 및 감사 로그</h2>
-            <p>조회자: 보기 전용 · 운영자: 경고 확인/정상 등록, PCAP 분석 · 관리자: 모드 변경, 취약점 DB, 사용자 관리</p>
+            <h2>Users &amp; Audit Log</h2>
+            <p>Viewer: read-only · Operator: acknowledge/learn alerts, PCAP analysis · Admin: baseline mode, VulnDB, updates, users</p>
           </div>
         </div>
         <form id="user-form" class="user-form">
-          <input id="new-username" placeholder="사용자 이름" autocomplete="off" required>
-          <input id="new-user-password" type="password" placeholder="임시 비밀번호 (10자 이상)" autocomplete="new-password" minlength="10" required>
-          <select id="new-user-role" aria-label="역할">
-            <option value="viewer">조회자</option>
-            <option value="operator">운영자</option>
-            <option value="admin">관리자</option>
+          <input id="new-username" placeholder="Username" autocomplete="off" required>
+          <input id="new-user-password" type="password" placeholder="Temporary password (10+ chars)" autocomplete="new-password" minlength="10" required>
+          <select id="new-user-role" aria-label="Role">
+            <option value="viewer">Viewer</option>
+            <option value="operator">Operator</option>
+            <option value="admin">Admin</option>
           </select>
-          <button class="button" type="submit">사용자 추가</button>
+          <button class="button" type="submit">Add User</button>
           <span id="user-form-status" class="import-status"></span>
         </form>
         <div class="table-wrap">
           <table class="alerts-table">
-            <thead><tr><th>사용자</th><th>역할</th><th>상태</th><th>생성</th><th></th></tr></thead>
+            <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th></th></tr></thead>
             <tbody id="users-body"></tbody>
           </table>
         </div>
         <div id="siem-status" class="siem-status"></div>
         <div class="table-wrap audit-wrap">
           <table class="alerts-table">
-            <thead><tr><th>시각</th><th>사용자</th><th>접속 IP</th><th>작업</th><th>결과</th></tr></thead>
+            <thead><tr><th>Time</th><th>User</th><th>Client IP</th><th>Action</th><th>Status</th></tr></thead>
             <tbody id="audit-body"></tbody>
           </table>
         </div>
@@ -305,50 +357,50 @@
 
       <dialog id="password-dialog" class="password-dialog">
         <form id="password-form" method="dialog">
-          <h2>비밀번호 변경</h2>
-          <label>현재 비밀번호 <input id="pw-current" type="password" autocomplete="current-password" required></label>
-          <label>새 비밀번호 (10자 이상) <input id="pw-new" type="password" autocomplete="new-password" minlength="10" required></label>
-          <label>새 비밀번호 확인 <input id="pw-confirm" type="password" autocomplete="new-password" minlength="10" required></label>
+          <h2>Change Password</h2>
+          <label>Current Password <input id="pw-current" type="password" autocomplete="current-password" required></label>
+          <label>New Password (10+ chars) <input id="pw-new" type="password" autocomplete="new-password" minlength="10" required></label>
+          <label>Confirm New Password <input id="pw-confirm" type="password" autocomplete="new-password" minlength="10" required></label>
           <p id="pw-error" class="form-error" hidden></p>
           <div class="dialog-actions">
-            <button class="button ghost" type="button" id="pw-cancel">취소</button>
-            <button class="button" type="submit">변경</button>
+            <button class="button ghost" type="button" id="pw-cancel">Cancel</button>
+            <button class="button" type="submit">Change</button>
           </div>
         </form>
       </dialog>
 
       <dialog id="asset-dialog" class="password-dialog asset-dialog">
         <form id="asset-form" method="dialog">
-          <h2>자산 정보 편집 <small id="asset-dialog-id" class="mono"></small></h2>
-          <p class="dialog-hint">입력한 값이 자동 식별 값보다 우선합니다. 비워 두면 자동 식별 값(회색 글씨)을 씁니다.
-            벤더·모델·펌웨어를 넣으면 취약점 대조에도 쓰입니다.</p>
+          <h2>Edit Asset Information <small id="asset-dialog-id" class="mono"></small></h2>
+          <p class="dialog-hint">Manual entries override auto-detected values. Leave blank to fall back to detected values.
+            Vendor, model, and firmware are also used for offline vulnerability matching.</p>
           <div class="asset-form-grid">
-            <label>표시 이름 <input name="name" maxlength="80" placeholder="예: 보일러 #2 제어 PLC"></label>
-            <label>장비 유형 <input name="device_type" maxlength="80" list="device-types"></label>
-            <label>벤더 <input name="vendor" maxlength="120"></label>
-            <label>모델 / 주문번호 <input name="model" maxlength="120"></label>
-            <label>펌웨어 <input name="firmware" maxlength="60"></label>
-            <label>운영체제 <input name="os" maxlength="120"></label>
-            <label>위치 (공정·라인·설치 장소) <input name="location" maxlength="120"></label>
-            <label>담당자 <input name="owner" maxlength="120"></label>
-            <label>중요도
+            <label>Display Name <input name="name" maxlength="80" placeholder="e.g. Boiler #2 Main PLC"></label>
+            <label>Device Type <input name="device_type" maxlength="80" list="device-types"></label>
+            <label>Vendor <input name="vendor" maxlength="120"></label>
+            <label>Model / Order Number <input name="model" maxlength="120"></label>
+            <label>Firmware <input name="firmware" maxlength="60"></label>
+            <label>Operating System <input name="os" maxlength="120"></label>
+            <label>Location (Line / Zone / Rack) <input name="location" maxlength="120"></label>
+            <label>Owner <input name="owner" maxlength="120"></label>
+            <label>Criticality
               <select name="criticality">
-                <option value="">미지정</option>
-                <option value="low">낮음</option>
-                <option value="medium">보통</option>
-                <option value="high">높음</option>
-                <option value="critical">심각 (핵심 설비)</option>
+                <option value="">Unspecified</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical (Core Equipment)</option>
               </select>
             </label>
           </div>
-          <label>메모 <textarea name="notes" maxlength="2000" rows="4" placeholder="점검 이력, 교체 계획, 접속 방법 등"></textarea></label>
+          <label>Notes <textarea name="notes" maxlength="2000" rows="4" placeholder="Maintenance history, replacement plan, access notes"></textarea></label>
           <p class="dialog-meta" id="asset-dialog-meta"></p>
           <p id="asset-error" class="form-error" hidden></p>
           <div class="dialog-actions">
-            <button class="button ghost danger" type="button" id="asset-clear">입력값 모두 지우기</button>
+            <button class="button ghost danger" type="button" id="asset-clear">Clear Manual Fields</button>
             <span class="spacer"></span>
-            <button class="button ghost" type="button" id="asset-cancel">취소</button>
-            <button class="button" type="submit">저장</button>
+            <button class="button ghost" type="button" id="asset-cancel">Cancel</button>
+            <button class="button" type="submit">Save</button>
           </div>
         </form>
       </dialog>
@@ -371,8 +423,15 @@
       </datalist>
 
       <footer>
-        <span>NetEye · 패킷 내용은 저장하지 않습니다.</span>
-        <span id="capture-interface">센서 인터페이스 미설정</span>
+        <span id="footer-brand">NetEye · Packet payloads are never stored.</span>
+        <span class="footer-links">
+          <a id="footer-issues" href="https://github.com/knoxxr/NetEye/issues/new/choose" target="_blank" rel="noopener noreferrer">GitHub Issues</a>
+          ·
+          <a id="footer-discussions" href="https://github.com/knoxxr/NetEye/discussions" target="_blank" rel="noopener noreferrer">GitHub Discussions</a>
+          ·
+          <a id="footer-releases" href="https://github.com/knoxxr/NetEye/releases" target="_blank" rel="noopener noreferrer">Releases</a>
+        </span>
+        <span id="capture-interface">Capture interface not configured</span>
       </footer>
     </main>
     <script src="/assets/graph.js" defer></script>

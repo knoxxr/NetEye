@@ -75,7 +75,7 @@ class NetGraph {
         const protocols = new Map();
         members.forEach((a) => (a.protocols || []).forEach((p) => protocols.set(p, (protocols.get(p) || 0) + 1)));
         external = {
-          id: NetGraph.EXTERNAL, label: `인터넷 · 외부 ${members.length}개`, device_type: "External", ip: null,
+          id: NetGraph.EXTERNAL, label: `Internet · ${members.length} external`, device_type: "External", ip: null,
           vendor: "", model: "", status: members.some((a) => a.status !== "stale") ? "online" : "stale",
           packets: members.reduce((sum, a) => sum + (a.packets || 0), 0),
           protocols: [...protocols.entries()].sort((x, y) => y[1] - x[1]).map(([p]) => p),
@@ -83,7 +83,7 @@ class NetGraph {
           orgs: (() => {
             const count = new Map();
             members.forEach((a) => {
-              const name = (a.org && a.org.name) || (a.domains || []).slice(-1)[0] || "조직 미상";
+              const name = (a.org && a.org.name) || (a.domains || []).slice(-1)[0] || "Unknown org";
               count.set(name, (count.get(name) || 0) + 1);
             });
             return [...count.entries()].sort((x, y) => y[1] - x[1]);
@@ -126,11 +126,11 @@ class NetGraph {
       node.sub = (() => {
         const identity = [asset.vendor, asset.model].filter(Boolean).join(" ");
         if (named) return [asset.label, identity || asset.os].filter(Boolean).join(" · ").slice(0, 40);
-        return (identity || asset.os || (asset.device_type === "Unknown" ? "미확인 자산" : asset.device_type)).slice(0, 40);
+        return (identity || asset.os || (asset.device_type === "Unknown" ? "Unknown Asset" : asset.device_type)).slice(0, 40);
       })();
       // Bigger circles for assets that carry more traffic (log scale, 0.8x .. 1.7x).
       node.scale = Math.min(1.7, Math.max(0.8, 0.8 + 0.16 * Math.log10(1 + (asset.packets || 0))));
-      if (asset.id === NetGraph.EXTERNAL) node.sub = "외부 주소 묶음 · 클릭하면 펼침";
+      if (asset.id === NetGraph.EXTERNAL) node.sub = "External hosts · click to expand";
       node.style = NetGraph.styleOf(asset);
       node.offline = asset.status === "stale";
       node.glyph = asset.id === NetGraph.EXTERNAL ? "◎" : asset.device_type === "Unknown" ? "?" : "◆";
@@ -240,10 +240,10 @@ class NetGraph {
 
   /** Subnet group: private /24, everything public, or layer-2 devices without an address. */
   static groupOf(asset) {
-    if (asset.id === NetGraph.EXTERNAL || NetGraph.isExternal(asset.ip)) return { key: "~ext", label: "외부망 · 인터넷" };
+    if (asset.id === NetGraph.EXTERNAL || NetGraph.isExternal(asset.ip)) return { key: "~ext", label: "External · Internet" };
     const m = /^(\d+\.\d+\.\d+)\.\d+$/.exec(asset.ip || "");
     if (m) return { key: `${m[1]}.0/24`, label: `${m[1]}.0/24` };
-    return asset.ip ? { key: "~other", label: "기타 주소" } : { key: "~l2", label: "L2 장비 (IP 없음)" };
+    return asset.ip ? { key: "~other", label: "Other Addresses" } : { key: "~l2", label: "L2 Devices (No IP)" };
   }
 
   /** Purdue level: 1 controllers and field devices, 2 supervisory, 3 site/IT, 4 external. */
@@ -607,23 +607,23 @@ class NetGraph {
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
     const rate = out + inn;
     if (node.id === NetGraph.EXTERNAL) {
-      const list = a.orgs.slice(0, 8).map(([name, n]) => `${name} ${n}`).join(", ")
-        + (a.orgs.length > 8 ? ` 외 ${a.orgs.length - 8}곳` : "");
+      const list = a.orgs.slice(0, 8).map(([name, n]) => `${name} (${n})`).join(", ")
+        + (a.orgs.length > 8 ? ` +${a.orgs.length - 8} more` : "");
       this.tooltip.innerHTML = `<strong>${esc(node.label)}</strong><span>${esc(list)}</span>
-        <span>통신 ${peers}건${rate ? ` · 최근 ${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()} pkt/s` : ""}</span>
-        <span>클릭하면 외부 주소를 하나씩 펼칩니다</span>`;
+        <span>${peers} links${rate ? ` · ${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()} pkt/s` : ""}</span>
+        <span>Click to expand external hosts</span>`;
       this.tooltip.hidden = false;
       this.placeTooltip(p);
       return;
     }
     this.tooltip.innerHTML = `<strong>${esc(node.label)}</strong><span>${esc(node.sub)}</span>
-      <span>통신 상대 ${peers}개${rate ? ` · 최근 ${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()} pkt/s` : ""}</span>
+      <span>${peers} peers${rate ? ` · ${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()} pkt/s` : ""}</span>
       ${node.label !== a.label ? `<span class="mono">${esc(a.label)}</span>` : ""}
-      ${a.manual && a.manual.location ? `<span>위치: <b>${esc(a.manual.location)}</b></span>` : ""}
-      ${a.manual && a.manual.owner ? `<span>담당자: <b>${esc(a.manual.owner)}</b></span>` : ""}
-      ${a.hostname ? `<span>컴퓨터 이름: <b>${esc(a.hostname)}</b></span>` : ""}
-      ${a.os ? `<span>운영체제: <b>${esc(a.os)}</b> (추정 ${Math.round(a.os_confidence * 100)}%)</span>` : ""}
-      <span>누적 ${(a.packets || 0).toLocaleString()} 패킷</span>
+      ${a.manual && a.manual.location ? `<span>Location: <b>${esc(a.manual.location)}</b></span>` : ""}
+      ${a.manual && a.manual.owner ? `<span>Owner: <b>${esc(a.manual.owner)}</b></span>` : ""}
+      ${a.hostname ? `<span>Hostname: <b>${esc(a.hostname)}</b></span>` : ""}
+      ${a.os ? `<span>OS: <b>${esc(a.os)}</b> (${Math.round(a.os_confidence * 100)}%)</span>` : ""}
+      <span>${(a.packets || 0).toLocaleString()} total packets</span>
       ${(a.protocols || []).length ? `<span class="mono">${esc(a.protocols.slice(0, 5).join(", "))}</span>` : ""}`;
     this.tooltip.hidden = false;
     this.placeTooltip(p);
@@ -1014,7 +1014,7 @@ class NetGraph {
       for (const [key, b] of boxes) {
         // Room for the largest node in the area and, above it, the area title.
         const padX = 40 * b.s + 8, padTop = 34 * b.s + 34, padBottom = 34 * b.s + 30;
-        const title = key === "~ext" ? b.label : `${b.label} · ${b.n}대`;
+        const title = key === "~ext" ? b.label : `${b.label} · ${b.n} ${b.n === 1 ? "host" : "hosts"}`;
         const span = b.x1 - b.x0 + 2 * padX, w = Math.max(span, ctx.measureText(title).width + 28);
         const x = b.x0 - padX - (w - span) / 2, y = b.y0 - padTop, h = b.y1 - b.y0 + padTop + padBottom;
         ctx.globalAlpha = 1;
@@ -1042,7 +1042,7 @@ class NetGraph {
         ctx.lineWidth = px;
         ctx.beginPath(); ctx.moveTo(vx0, y); ctx.lineTo(vx1, y); ctx.stroke();
         // Band titles stay readable at any zoom: drawn at a fixed screen size at the left edge.
-        ctx.font = `600 ${12 * px}px 'Segoe UI', 'Malgun Gothic', sans-serif`;
+        ctx.font = `600 ${12 * px}px 'Segoe UI', system-ui, sans-serif`;
         ctx.fillStyle = "#8fb4ff";
         ctx.fillText(NetGraph.LEVEL_LABEL[level], vx0 + 60 + 12 * px, y + 20 * px);
       }
@@ -1074,10 +1074,10 @@ NetGraph.HEAT = ["#53647b", "#6f8fc0", "#45d6cb", "#f2d06b", "#ff9f5a"];
 NetGraph.EXTERNAL = "~internet";
 NetGraph.LEVEL_Y = { 4: -570, 3: -190, 2: 190, 1: 570 };
 NetGraph.LEVEL_LABEL = {
-  4: "Level 4–5 · 외부망 / 인터넷",
-  3: "Level 3 · 운영·IT망 (미분류 포함)",
-  2: "Level 2 · 감시·제어 (HMI · EWS · SCADA)",
-  1: "Level 0–1 · 제어기·현장 장비 (PLC · RTU · I/O)",
+  4: "Level 4–5 · External / Internet",
+  3: "Level 3 · Operations & IT (incl. Unclassified)",
+  2: "Level 2 · Supervisory Control (HMI · EWS · SCADA)",
+  1: "Level 0–1 · Field Control (PLC · RTU · I/O)",
 };
 NetGraph.MIN_ZOOM = 0.08;
 NetGraph.MAX_ZOOM = 6;

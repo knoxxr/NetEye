@@ -1,0 +1,184 @@
+name: Build & Release Installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  offline-data:
+    name: Build Offline Intel DBs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build VulnDB and IP2ASN
+        run: |
+          mkdir -p data
+          python3 tools/vulndb_build.py --fetch -o data/vulndb.json
+          python3 tools/ipasn_build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neteye-offline-data
+          path: |
+            data/vulndb.json
+            data/ip2asn-v4.tsv.gz
+          retention-days: 1
+
+  linux:
+    name: Linux (.deb / .tar.gz)
+    needs: offline-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: neteye-offline-data
+          path: data
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install cargo-zigbuild and ziglang
+        run: |
+          pip install ziglang
+          cargo install --locked cargo-zigbuild
+      - name: Package Linux installers
+        run: python3 tools/package.py linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neteye-linux
+          path: |
+            dist/neteye_*_amd64.deb
+            dist/neteye-*-linux-x86_64.tar.gz
+
+  windows:
+    name: Windows (.msi / Setup.exe)
+    needs: offline-data
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: neteye-offline-data
+          path: data
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install WiX 5 and extensions
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+      - name: Package Windows installers
+        shell: pwsh
+        run: python tools/package.py windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neteye-windows
+          path: |
+            dist/NetEye-*.msi
+            dist/NetEye-Setup-*.exe
+
+  macos:
+    name: macOS Universal (.pkg / .tar.gz)
+    needs: offline-data
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: neteye-offline-data
+          path: data
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package macOS Universal installers
+        run: python3 tools/package.py macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neteye-macos
+          path: |
+            dist/NetEye-*-macos-universal.pkg
+            dist/neteye-*-macos-universal.tar.gz
+
+  android:
+    name: Android ARM64 (.apk)
+    needs: offline-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: neteye-offline-data
+          path: data
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup Gradle & Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358" "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+      - name: Package Android APK
+        run: python3 tools/package.py android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neteye-android
+          path: dist/NetEye-*-android-arm64.apk
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd release-files
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-files/* \
+            --title "NetEye ${GITHUB_REF_NAME}" \
+            --generate-notes

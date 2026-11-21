@@ -38,10 +38,17 @@ pub struct AppState {
     /// Syslog/CEF forwarding to the SIEM, when NETEYE_SYSLOG is set.
     pub siem: Option<crate::siem::Forwarder>,
     pub throttle: crate::auth::Throttle,
+    pub updater: Arc<crate::update::UpdateManager>,
 }
 
 impl AppState {
     pub fn new(config: Config, engine: Arc<Mutex<Engine>>, store: Option<Store>, vulndb_error: Option<String>) -> Self {
+        let data_dir = config.db_path.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| std::path::PathBuf::from("data"));
+        let updater = Arc::new(crate::update::UpdateManager::new(
+            crate::update::UpdateConfig::from_env(),
+            data_dir,
+            config.frontend.clone(),
+        ));
         AppState {
             vulndb_state: Mutex::new(json!({"path": config.vulndb_path.display().to_string(), "error": vulndb_error})),
             config,
@@ -55,6 +62,7 @@ impl AppState {
             sessions: Default::default(),
             siem: None,
             throttle: Default::default(),
+            updater,
         }
     }
 
@@ -130,6 +138,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/integrations", get(integrations))
         .route("/api/sensor", get(sensor_settings))
         .route("/api/sensor/capture", post(set_capture_interface))
+        .route("/api/version", get(version_info))
+        .route("/api/update", get(update_status))
+        .route("/api/update/check", post(update_check))
+        .route("/api/update/apply", post(update_apply))
+        .route("/api/update/settings", post(update_settings))
         // Layers run outermost-last: host/origin guard first, then authentication + audit.
         .layer(axum::middleware::from_fn_with_state(state.clone(), account::middleware))
         .layer(axum::middleware::from_fn_with_state(Arc::new(state.config.allowed_hosts.clone()),
@@ -148,6 +161,57 @@ async fn sensor_settings(State(s): State<Arc<AppState>>) -> Json<Value> {
         "interfaces": interfaces, "error": error, "sensor": s.sensor.lock().clone(),
         "config_file": crate::config_file().map(|p| p.display().to_string()),
     }))
+}
+
+async fn version_info(State(s): State<Arc<AppState>>) -> Json<Value> {
+    Json(crate::update::version_summary_json(&s.updater))
+}
+
+async fn update_status(State(s): State<Arc<AppState>>) -> Json<Value> {
+    Json(serde_json::to_value(s.updater.status()).unwrap_or_else(|_| json!({})))
+}
+
+async fn update_check(State(s): State<Arc<AppState>>) -> Json<Value> {
+    let updater = s.updater.clone();
+    let status = tokio::task::spawn_blocking(move || updater.check_now()).await.unwrap();
+    Json(serde_json::to_value(status).unwrap_or_else(|_| json!({})))
+}
+
+async fn update_apply(State(s): State<Arc<AppState>>) -> Response {
+    let updater = s.updater.clone();
+    let result = tokio::task::spawn_blocking(move || updater.apply_now()).await.unwrap();
+    match result {
+        Ok(status) => {
+            let s_flush = s.clone();
+            let _ = tokio::task::spawn_blocking(move || s_flush.flush()).await;
+            Json(serde_json::to_value(status).unwrap_or_else(|_| json!({}))).into_response()
+        }
+        Err(msg) => error(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsReq {
+    auto_check: Option<bool>,
+    auto_apply: Option<bool>,
+}
+
+async fn update_settings(State(s): State<Arc<AppState>>, Json(req): Json<UpdateSettingsReq>) -> Json<Value> {
+    let status = s.updater.set_settings(req.auto_check, req.auto_apply);
+    let mut warning = None;
+    if let Some(v) = req.auto_check
+        && let Err(e) = crate::save_setting("NETEYE_UPDATE_CHECK", if v { "1" } else { "0" }) {
+            warning = Some(format!("Applied in memory, but could not save to config file: {e}"));
+        }
+    if let Some(v) = req.auto_apply
+        && let Err(e) = crate::save_setting("NETEYE_AUTO_UPDATE", if v { "1" } else { "0" }) {
+            warning = Some(format!("Applied in memory, but could not save to config file: {e}"));
+        }
+    let mut out = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
+    if let (Some(obj), Some(w)) = (out.as_object_mut(), warning) {
+        obj.insert("warning".into(), Value::from(w));
+    }
+    Json(out)
 }
 
 #[derive(Deserialize)]
