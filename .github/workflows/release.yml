@@ -173,6 +173,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd release-files
+          rm -f vulndb.json ip2asn-v4.tsv.gz
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Create GitHub Release
@@ -180,5 +181,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" release-files/* \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "NetEye ${GITHUB_REF_NAME}" \
             --generate-notes
