@@ -13,6 +13,7 @@ mod api;
 mod auth;
 mod baseline;
 mod decode;
+mod discover;
 mod dissect;
 mod engine;
 mod guard;

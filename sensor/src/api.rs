@@ -29,8 +29,10 @@ pub struct AppState {
     pub store: Mutex<Option<Store>>,
     pub sensor: Mutex<Value>,
     pub import: Arc<Mutex<Value>>,
+    pub discover: Arc<Mutex<Value>>,
     pub vulndb_state: Mutex<Value>,
     import_running: AtomicBool,
+    discover_running: AtomicBool,
     /// Live capture: generation (to ignore a stopping thread's last word) and its stop flag.
     capture: Mutex<(u64, Option<Arc<AtomicBool>>)>,
     cache: Mutex<(u64, i64, Arc<String>)>,
@@ -56,7 +58,9 @@ impl AppState {
             store: Mutex::new(store),
             sensor: Mutex::new(json!({"enabled": false, "interface": null, "error": null})),
             import: Arc::new(Mutex::new(json!({"running": false, "file": null, "frames": 0, "error": null, "last_result": null}))),
+            discover: Arc::new(Mutex::new(json!({"running": false, "cidr": null, "done": 0, "total": 0, "found": 0, "error": null, "last_result": null}))),
             import_running: AtomicBool::new(false),
+            discover_running: AtomicBool::new(false),
             capture: Mutex::new((0, None)),
             cache: Mutex::new((u64::MAX, 0, Arc::new(String::new()))),
             sessions: Default::default(),
@@ -77,10 +81,10 @@ impl AppState {
             }
         }
         let body = self.engine.lock().snapshot_json(now);
-        let mut text = String::with_capacity(body.len() + 512);
+        let mut text = String::with_capacity(body.len() + 640);
         text.push_str(&body[..body.len().saturating_sub(1)]);
-        text.push_str(&format!(",\"sensor\":{},\"import\":{},\"vulndb_state\":{}}}",
-                               self.sensor.lock(), self.import.lock(), self.vulndb_state.lock()));
+        text.push_str(&format!(",\"sensor\":{},\"import\":{},\"discover\":{},\"vulndb_state\":{}}}",
+                               self.sensor.lock(), self.import.lock(), self.discover.lock(), self.vulndb_state.lock()));
         let text = Arc::new(text);
         *self.cache.lock() = (generation, now, text.clone());
         text
@@ -127,6 +131,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vulns", get(vulns))
         .route("/api/vulndb", get(vulndb_info).post(upload_vulndb).layer(DefaultBodyLimit::max(128 << 20)))
         .route("/api/pcap", post(upload_pcap).layer(DefaultBodyLimit::disable()))
+        .route("/api/discover", get(discover_info).post(start_discover))
         .route("/ws", get(ws))
         .route("/api/login", post(account::login))
         .route("/api/logout", post(account::logout))
@@ -212,6 +217,74 @@ async fn update_settings(State(s): State<Arc<AppState>>, Json(req): Json<UpdateS
         obj.insert("warning".into(), Value::from(w));
     }
     Json(out)
+}
+
+async fn discover_info(State(s): State<Arc<AppState>>) -> Json<Value> {
+    let detected = tokio::task::spawn_blocking(|| crate::discover::resolve_target(None)).await.unwrap();
+    let (default_cidr, local_ip, detect_error) = match detected {
+        Ok(t) => (Value::from(t.cidr), Value::from(t.local_ip.to_string()), Value::Null),
+        Err(e) => (Value::Null, Value::Null, Value::from(e)),
+    };
+    Json(json!({
+        "default_cidr": default_cidr,
+        "local_ip": local_ip,
+        "detect_error": detect_error,
+        "state": s.discover.lock().clone(),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct DiscoverRequest {
+    cidr: Option<String>,
+}
+
+async fn start_discover(State(s): State<Arc<AppState>>, body: Option<Json<DiscoverRequest>>) -> Response {
+    let req_cidr = body.and_then(|Json(r)| r.cidr);
+    let target = match crate::discover::resolve_target(req_cidr.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    if s.discover_running.swap(true, Ordering::SeqCst) {
+        return error(StatusCode::CONFLICT, "A LAN scan is already running.");
+    }
+    {
+        let mut st = s.discover.lock();
+        st["running"] = true.into();
+        st["cidr"] = target.cidr.clone().into();
+        st["done"] = 0.into();
+        st["total"] = target.hosts.len().into();
+        st["found"] = 0.into();
+        st["error"] = Value::Null;
+    }
+    s.invalidate();
+    let state = s.clone();
+    let cidr_arg = Some(target.cidr.clone());
+    std::thread::spawn(move || {
+        let discover = state.discover.clone();
+        let state_cb = state.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::discover::scan_lan(&state.engine, cidr_arg.as_deref(), move |done, total, found| {
+                let mut st = discover.lock();
+                st["done"] = done.into();
+                st["total"] = total.into();
+                st["found"] = found.into();
+                drop(st);
+                state_cb.invalidate();
+            })
+        })).unwrap_or_else(|_| Err("Internal error during LAN discovery".to_string()));
+        {
+            let mut st = state.discover.lock();
+            match result {
+                Ok(summary) => st["last_result"] = summary,
+                Err(e) => st["error"] = e.into(),
+            }
+            st["running"] = false.into();
+        }
+        state.flush();
+        state.invalidate();
+        state.discover_running.store(false, Ordering::SeqCst);
+    });
+    Json(json!({"accepted": true, "cidr": target.cidr, "hosts": target.hosts.len()})).into_response()
 }
 
 #[derive(Deserialize)]

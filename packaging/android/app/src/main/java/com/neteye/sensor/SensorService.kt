@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -14,6 +15,7 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
+import java.net.Inet4Address
 import java.net.URL
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
@@ -146,6 +148,7 @@ class SensorService : Service() {
                 throw IllegalStateException("Bundled sensor binaries not found (${nativeDir.absolutePath})")
             }
 
+            val lanCidr = detectLanCidr()
             updateState(State(Status.STARTING, "Starting BangDB and NetEye engine..."))
             val pb = ProcessBuilder(neteyeBin.absolutePath, "serve").apply {
                 directory(dataDir)
@@ -160,6 +163,9 @@ class SensorService : Service() {
                     put("NETEYE_IPASN", File(dataDir, "ip2asn-v4.tsv.gz").absolutePath)
                     put("NETEYE_BLOCKLIST", File(dataDir, "blocklist.txt").absolutePath)
                     put("TMPDIR", cacheDir.absolutePath)
+                    if (!lanCidr.isNullOrBlank()) {
+                        put("NETEYE_LAN_CIDR", lanCidr)
+                    }
                 }
             }
 
@@ -208,6 +214,23 @@ class SensorService : Service() {
             running.set(false)
             stopSensorProcess()
             updateState(State(Status.ERROR, e.message ?: "Unknown error"))
+        }
+    }
+
+    private fun detectLanCidr(): String? {
+        return try {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+            val net = cm.activeNetwork ?: return null
+            val lp = cm.getLinkProperties(net) ?: return null
+            val v4 = lp.linkAddresses.firstOrNull {
+                val addr = it.address
+                addr is Inet4Address && !addr.isLoopbackAddress
+            } ?: return null
+            val prefix = v4.prefixLength.coerceIn(24, 30)
+            "${v4.address.hostAddress}/$prefix"
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to query active LAN CIDR", e)
+            null
         }
     }
 

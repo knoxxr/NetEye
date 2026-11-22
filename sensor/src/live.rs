@@ -51,9 +51,11 @@ fn library() -> Result<Library, String> {
         }
     }
     Err(if cfg!(windows) {
-        format!("Npcap이 설치되어 있지 않습니다 (https://npcap.com): {last}")
+        format!("Npcap is not installed (https://npcap.com): {last}")
+    } else if cfg!(target_os = "android") {
+        "Live raw packet capture is unavailable on non-root Android (use Scan LAN or Analyze PCAP)".to_string()
     } else {
-        format!("libpcap을 찾을 수 없습니다 (libpcap 패키지 설치 필요): {last}")
+        format!("libpcap not found (install libpcap package, or use Scan LAN / Analyze PCAP): {last}")
     })
 }
 

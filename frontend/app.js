@@ -175,7 +175,7 @@ function render(snapshot) {
   document.getElementById("asset-count-badge").textContent = visibleAssets.length;
   document.getElementById("empty-state").hidden = assets.length > 0;
   renderStatus(snapshot.sensor || {});
-  renderImport(snapshot.import || {});
+  renderImport(snapshot.import || {}, snapshot.discover || {});
   renderBaseline(snapshot.baseline);
   renderVulns(snapshot);
   document.getElementById("stat-vuln").textContent = stats.vulnerable_assets ?? 0;
@@ -199,20 +199,41 @@ function renderStatus(sensor) {
   pill.innerHTML = `<span class="status-dot"></span>${label}`;
   const interfaceLabel = sensor.interface
     ? `Capture interface: ${sensor.interface}`
-    : "Set NETEYE_INTERFACE for live capture or upload a PCAP file";
+    : "Set NETEYE_INTERFACE for live capture, click Scan LAN, or upload a PCAP file";
   document.getElementById("capture-interface").textContent = sensor.error
     ? `${interfaceLabel} · ${sensor.error}` : interfaceLabel;
   pill.title = sensor.error || "";
 }
 
-function renderImport(state) {
+function renderImport(state, discover) {
   const el = document.getElementById("import-status");
-  if (state.running) {
+  const btn = document.getElementById("btn-discover");
+  const emptyBtn = document.getElementById("btn-empty-discover");
+  const scanning = Boolean(discover && discover.running);
+  if (btn) {
+    btn.disabled = scanning;
+    btn.textContent = scanning ? "Scanning LAN…" : "Scan LAN";
+  }
+  if (emptyBtn) {
+    emptyBtn.disabled = scanning;
+    emptyBtn.textContent = scanning ? "Scanning Local Wi-Fi / LAN…" : "Scan Local Wi-Fi / LAN";
+  }
+  if (scanning) {
+    el.textContent = `Scanning ${discover.cidr || "LAN"}… ${discover.done}/${discover.total} hosts · ${discover.found} found`;
+    el.className = "import-status running";
+  } else if (state.running) {
     el.textContent = `Analyzing ${state.file}… ${state.frames.toLocaleString()} frames`;
     el.className = "import-status running";
+  } else if (discover && discover.error) {
+    el.textContent = `LAN scan failed: ${discover.error}`;
+    el.className = "import-status error";
   } else if (state.error) {
     el.textContent = `Import failed: ${state.error}`;
     el.className = "import-status error";
+  } else if (discover && discover.last_result && (!state.last_result || !el.dataset.lastImport)) {
+    const r = discover.last_result;
+    el.textContent = `LAN ${r.cidr}: ${r.hosts_found} hosts, ${r.services_found} services found (${(r.duration_ms / 1000).toFixed(1)}s)`;
+    el.className = "import-status";
   } else if (state.last_result) {
     el.textContent = `${state.last_result.file}: ${state.last_result.frames.toLocaleString()} frames analyzed`;
     el.className = "import-status";
@@ -645,6 +666,33 @@ document.getElementById("pcap-input").addEventListener("change", async (event) =
     status.className = "import-status error";
   }
 });
+
+async function triggerLanScan() {
+  const status = document.getElementById("import-status");
+  delete status.dataset.lastImport;
+  status.textContent = "Starting local Wi-Fi / LAN scan…";
+  status.className = "import-status running";
+  try {
+    const response = await api("/api/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      status.textContent = `LAN scan failed: ${data.detail || response.status}`;
+      status.className = "import-status error";
+      return;
+    }
+    status.textContent = `Scanning ${data.cidr} (${data.hosts} hosts)…`;
+    await loadSnapshot();
+  } catch (err) {
+    status.textContent = `LAN scan failed: ${err.message}`;
+    status.className = "import-status error";
+  }
+}
+document.getElementById("btn-discover")?.addEventListener("click", triggerLanScan);
+document.getElementById("btn-empty-discover")?.addEventListener("click", triggerLanScan);
 
 async function loadSnapshot() {
   const response = await api("/api/snapshot");

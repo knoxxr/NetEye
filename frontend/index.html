@@ -59,6 +59,9 @@
         </div>
         <div class="heading-actions">
           <span id="import-status" class="import-status"></span>
+          <button id="btn-discover" class="button ghost" type="button" data-min-role="operator" title="Discover devices on your local Wi-Fi / LAN subnet (no root required)">
+            Scan LAN
+          </button>
           <label class="button" data-min-role="operator" title="Analyze a pcap or pcapng capture file">
             <input id="pcap-input" type="file" accept=".pcap,.pcapng,.cap" hidden>
             Analyze PCAP
@@ -157,7 +160,10 @@
             <div id="empty-state" class="empty-state">
               <div class="empty-icon">⌁</div>
               <strong>No assets observed yet</strong>
-              <span>Configure a SPAN/TAP capture interface or upload a PCAP file to map assets and communications.</span>
+              <span>Configure a SPAN/TAP capture interface, scan your local Wi-Fi/LAN subnet, or upload a PCAP file.</span>
+              <button id="btn-empty-discover" class="button primary-inline" type="button" data-min-role="operator" style="margin-top:12px;pointer-events:auto;">
+                Scan Local Wi-Fi / LAN
+              </button>
             </div>
           </div>
           <div class="legend">
